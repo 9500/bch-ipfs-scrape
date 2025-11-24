@@ -592,7 +592,7 @@ export async function getBCMRRegistries(options?: {
           }
 
           // Store in new cache
-          newCache.entries[result.tokenId] = authchainResult.entry;
+          newCache.entries[result.authbase] = authchainResult.entry;
 
           // Add to registries
           registries.push(result);
