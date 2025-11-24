@@ -32,6 +32,8 @@ BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain
    ```
    CHAINGRAPH_URL=http://your-chaingraph-server:8088/v1/graphql
    FULCRUM_WS_URL=ws://your-fulcrum-server:50003
+   # Optional: Set a working directory for all output files
+   # BCMR_WORKDIR=/path/to/data
    ```
 
 4. **Run the tool:**
@@ -234,6 +236,27 @@ bch-ipfs-scrape --authchain-resolve \
   --export-bcmr-ipfs-cids --cids-file my-cids.txt
 ```
 
+## Working Directory
+
+By default, all output files are saved in the current working directory. You can specify a custom working directory using the `BCMR_WORKDIR` environment variable:
+
+```bash
+# Set in .env file
+BCMR_WORKDIR=/home/user/bcmr-data
+
+# Or set temporarily for a single command
+BCMR_WORKDIR=./data bch-ipfs-scrape --authchain-resolve
+```
+
+When `BCMR_WORKDIR` is set:
+- All output files and folders are saved relative to this directory
+- The directory is automatically created if it doesn't exist
+- Useful for organizing data or running multiple instances with different datasets
+
+When `BCMR_WORKDIR` is not set:
+- Files are saved in the current working directory (original behavior)
+- Maintains backward compatibility with existing setups
+
 ## Output Files
 
 - `authhead.json` - Current registries: active + burned, excludes superseded (created by `--authchain-resolve`)
@@ -243,6 +266,8 @@ bch-ipfs-scrape --authchain-resolve \
 - `bcmr-registries/*.json` - Downloaded registry JSON files (created by `--fetch-json`)
 - `bcmr-registries/.authchain-cache.json` - Authchain cache (auto-generated)
 - `bcmr-registries/.ipfs-pin-cache.json` - IPFS pin cache (auto-generated)
+
+**Note:** All output files are relative to `BCMR_WORKDIR` if specified, otherwise relative to the current directory.
 
 ## Requirements
 

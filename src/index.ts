@@ -28,6 +28,28 @@ try {
 dotenv.config();
 
 /**
+ * Get the working directory from environment variable
+ * If BCMR_WORKDIR is set, all file paths will be relative to this directory
+ */
+function getWorkDir(): string | null {
+  return process.env.BCMR_WORKDIR || null;
+}
+
+/**
+ * Resolve a path relative to the work directory if specified
+ * If BCMR_WORKDIR is not set, returns the path as-is (relative to current directory)
+ * @param relativePath - The relative path to resolve
+ * @returns Absolute or relative path depending on BCMR_WORKDIR
+ */
+function resolveWorkPath(relativePath: string): string {
+  const workDir = getWorkDir();
+  if (workDir) {
+    return join(workDir, relativePath);
+  }
+  return relativePath;
+}
+
+/**
  * Registry entry in authhead.json (active registries only)
  */
 interface AuthheadRegistry {
@@ -76,13 +98,13 @@ function parseArgs(): {
   let exportCashtokenIpfsCids = false;
   let fetchJson = false;
   let ipfsPin = false;
-  let authheadFile = './authhead.json';
-  let exportFile = 'exported-urls.txt';
-  let cidsFile = 'bcmr-ipfs-cids.txt';
-  let cashtokenCidsFile = 'cashtoken-ipfs-cids.txt';
+  let authheadFile = resolveWorkPath('./authhead.json');
+  let exportFile = resolveWorkPath('exported-urls.txt');
+  let cidsFile = resolveWorkPath('bcmr-ipfs-cids.txt');
+  let cashtokenCidsFile = resolveWorkPath('cashtoken-ipfs-cids.txt');
   let ipfsPinCidsFile: string | null = null; // null = pin both files by default
   let ipfsPinConcurrency = 5; // Default: 5 concurrent pins
-  let jsonFolder = './bcmr-registries';
+  let jsonFolder = resolveWorkPath('./bcmr-registries');
   let maxFileSizeMB = 50; // Default: 50MB
   let ipfsPinTimeout = 5; // Default: 5 seconds
   let useCache = true;
@@ -307,6 +329,9 @@ Protocol Filters:
 Environment Variables:
   CHAINGRAPH_URL    GraphQL endpoint for Chaingraph (required)
   FULCRUM_WS_URL    Fulcrum WebSocket endpoint for authchain resolution (required)
+  BCMR_WORKDIR      Working directory for all output files (optional)
+                    If set, all files/folders will be saved relative to this directory
+                    If not set, files are saved in the current working directory
 
 Notes:
   Adjust --concurrency (1-200) to balance server load.
@@ -869,7 +894,7 @@ async function doIPFSPin(options: {
   }
 
   // Determine which files to pin
-  const defaultFiles = ['bcmr-ipfs-cids.txt', 'cashtoken-ipfs-cids.txt'];
+  const defaultFiles = [resolveWorkPath('bcmr-ipfs-cids.txt'), resolveWorkPath('cashtoken-ipfs-cids.txt')];
   const filesToPin = cidsFile ? [cidsFile] : defaultFiles;
 
   if (cidsFile === null) {
@@ -877,7 +902,7 @@ async function doIPFSPin(options: {
   }
 
   // Load pin cache
-  const pinCacheFile = './bcmr-registries/.ipfs-pin-cache.json';
+  const pinCacheFile = resolveWorkPath('./bcmr-registries/.ipfs-pin-cache.json');
   let pinnedCidsCache = new Set<string>();
 
   if (existsSync(pinCacheFile)) {
@@ -1195,6 +1220,19 @@ async function main(): Promise<void> {
     if (args.showHelp || (!args.authchainResolve && !args.export && !args.exportBcmrIpfsCids && !args.exportCashtokenIpfsCids && !args.fetchJson && !args.ipfsPin)) {
       printUsage();
       process.exit(0);
+    }
+
+    // Create work directory if BCMR_WORKDIR is specified
+    const workDir = getWorkDir();
+    if (workDir) {
+      try {
+        mkdirSync(workDir, { recursive: true });
+        console.log(`Using work directory: ${workDir}`);
+      } catch (error) {
+        console.error(`Error: Failed to create work directory: ${workDir}`);
+        console.error(error instanceof Error ? error.message : error);
+        process.exit(1);
+      }
     }
 
     // Check for required environment variables (only for commands that need them)
