@@ -419,25 +419,22 @@ async function resolveAuthchain(
  * @param options.cachePath - Path to cache file (default: ./bcmr-registries/.authchain-cache.json)
  * @param options.verbose - Enable verbose logging for detailed diagnostics (default: false)
  * @param options.concurrency - Number of parallel authchain resolutions (default: 50)
+ * @param options.chaingraphData - Pre-loaded Chaingraph data (if provided, skips Chaingraph query)
  */
 export async function getBCMRRegistries(options?: {
   useCache?: boolean;
   cachePath?: string;
   verbose?: boolean;
   concurrency?: number;
+  chaingraphData?: { data?: { search_output_prefix?: BCMROutput[] } };
 }): Promise<BCMRRegistry[]> {
   const useCache = options?.useCache !== false;
   const cachePath = options?.cachePath || './bcmr-registries/.authchain-cache.json';
   const verbose = options?.verbose || false;
   const concurrency = options?.concurrency || 50;
+  const chaingraphData = options?.chaingraphData;
 
   try {
-    const CHAINGRAPH_URL = process.env.CHAINGRAPH_URL || '';
-
-    if (!CHAINGRAPH_URL) {
-      throw new Error('CHAINGRAPH_URL environment variable is not set');
-    }
-
     // Load cache if enabled
     let oldCache: AuthchainCache | undefined;
     if (useCache) {
@@ -468,27 +465,46 @@ export async function getBCMRRegistries(options?: {
       console.log('Authchain cache disabled (--no-cache)');
     }
 
-    const response = await fetch(CHAINGRAPH_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        query: BCMR_QUERY,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`Chaingraph request failed: ${response.status}`);
-    }
-
-    const data = (await response.json()) as {
+    // Use pre-loaded data or fetch from Chaingraph
+    let data: {
       data?: { search_output_prefix?: BCMROutput[] };
       errors?: Array<{ message: string }>;
     };
 
-    if (data.errors) {
-      throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
+    if (chaingraphData) {
+      // Use pre-loaded data
+      console.log('Using pre-loaded Chaingraph data...');
+      data = chaingraphData;
+    } else {
+      // Fetch from Chaingraph
+      const CHAINGRAPH_URL = process.env.CHAINGRAPH_URL || '';
+
+      if (!CHAINGRAPH_URL) {
+        throw new Error('CHAINGRAPH_URL environment variable is not set');
+      }
+
+      const response = await fetch(CHAINGRAPH_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: BCMR_QUERY,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Chaingraph request failed: ${response.status}`);
+      }
+
+      data = (await response.json()) as {
+        data?: { search_output_prefix?: BCMROutput[] };
+        errors?: Array<{ message: string }>;
+      };
+
+      if (data.errors) {
+        throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
+      }
     }
 
     const outputs: BCMROutput[] = data.data?.search_output_prefix || [];

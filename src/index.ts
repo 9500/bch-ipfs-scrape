@@ -70,6 +70,7 @@ interface AuthheadRegistry {
  */
 function parseArgs(): {
   authchainResolve: boolean;
+  queryChaingraph: boolean;
   export: string | null;
   exportBcmrIpfsCids: boolean;
   exportCashtokenIpfsCids: boolean;
@@ -90,9 +91,12 @@ function parseArgs(): {
   concurrency: number;
   showHelp: boolean;
   showVersion: boolean;
+  chaingraphQueryFile: string | null;
+  chaingraphResultFile: string;
 } {
   const args = process.argv.slice(2);
   let authchainResolve = false;
+  let queryChaingraph = false;
   let exportProtocols: string | null = null;
   let exportBcmrIpfsCids = false;
   let exportCashtokenIpfsCids = false;
@@ -113,12 +117,28 @@ function parseArgs(): {
   let concurrency = 50;
   let showHelp = false;
   let showVersion = false;
+  let chaingraphQueryFile: string | null = null;
+  let chaingraphResultFile = resolveWorkPath('./chaingraph-result.json');
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
 
     if (arg === '--authchain-resolve') {
       authchainResolve = true;
+    } else if (arg === '--query-chaingraph') {
+      queryChaingraph = true;
+      // Check if next arg is a file path (doesn't start with --)
+      if (args[i + 1] && !args[i + 1].startsWith('--')) {
+        chaingraphQueryFile = args[i + 1];
+        i++;
+      }
+    } else if (arg === '--chaingraph-result-file') {
+      chaingraphResultFile = args[i + 1];
+      if (!chaingraphResultFile) {
+        console.error('Error: --chaingraph-result-file requires a path');
+        process.exit(1);
+      }
+      i++;
     } else if (arg === '--export') {
       exportProtocols = args[i + 1];
       if (!exportProtocols) {
@@ -227,6 +247,7 @@ function parseArgs(): {
 
   return {
     authchainResolve,
+    queryChaingraph,
     export: exportProtocols,
     exportBcmrIpfsCids,
     exportCashtokenIpfsCids,
@@ -247,6 +268,8 @@ function parseArgs(): {
     concurrency,
     showHelp,
     showVersion,
+    chaingraphQueryFile,
+    chaingraphResultFile,
   };
 }
 
@@ -260,7 +283,11 @@ BCMR Registry Tool
 Usage: bch-ipfs-scrape [command] [options]
 
 Commands:
-  --authchain-resolve           Resolve authchains and save to authhead.json
+  --query-chaingraph [file]     Query Chaingraph and save raw results to file
+                                Optional: provide custom GraphQL query file
+                                If no query file specified, uses default BCMR query
+  --authchain-resolve           Resolve authchains from Chaingraph result file and save to authhead.json
+                                (requires --query-chaingraph to be run first)
   --export <protocols>          Export URLs from authhead.json (IPFS, HTTPS, OTHER, ALL)
   --export-bcmr-ipfs-cids       Export IPFS CIDs from authhead.json (deduplicated, sorted)
   --export-cashtoken-ipfs-cids  Extract IPFS CIDs from BCMR JSON files (deduplicated, sorted)
@@ -269,6 +296,7 @@ Commands:
                                 (uses cache to skip already-pinned CIDs)
 
 Options:
+  --chaingraph-result-file <path>  Path to save/load Chaingraph results (default: ./chaingraph-result.json)
   --authhead-file <path>        Path to authhead.json (default: ./authhead.json)
   --export-file <filename>      Export output filename (default: exported-urls.txt)
   --cids-file <filename>        BCMR CIDs output filename (default: bcmr-ipfs-cids.txt)
@@ -287,38 +315,45 @@ Options:
 
 Workflow Examples:
 
-  1. Resolve authchains (creates authhead.json):
+  1. New two-step workflow (query then resolve):
+     bch-ipfs-scrape --query-chaingraph
      bch-ipfs-scrape --authchain-resolve
 
-  2. Export IPFS URLs from authhead.json:
+  2. Query with custom GraphQL query file:
+     bch-ipfs-scrape --query-chaingraph custom-query.graphql
+
+  3. Combined query and resolve in one command:
+     bch-ipfs-scrape --query-chaingraph --authchain-resolve
+
+  4. Export IPFS URLs from authhead.json:
      bch-ipfs-scrape --export IPFS
 
-  3. Export multiple protocol types:
+  5. Export multiple protocol types:
      bch-ipfs-scrape --export IPFS,HTTPS --export-file all-urls.txt
 
-  4. Export IPFS CIDs from authhead.json (deduplicated and sorted):
+  6. Export IPFS CIDs from authhead.json (deduplicated and sorted):
      bch-ipfs-scrape --export-bcmr-ipfs-cids
 
-  5. Extract IPFS CIDs from BCMR JSON files:
+  7. Extract IPFS CIDs from BCMR JSON files:
      bch-ipfs-scrape --export-cashtoken-ipfs-cids
 
-  6. Fetch BCMR JSON files:
+  8. Fetch BCMR JSON files:
      bch-ipfs-scrape --fetch-json
 
-  7. Pin IPFS CIDs using local IPFS daemon (pins from both CID files by default):
+  9. Pin IPFS CIDs using local IPFS daemon (pins from both CID files by default):
      bch-ipfs-scrape --ipfs-pin
      bch-ipfs-scrape --ipfs-pin --ipfs-pin-file bcmr-ipfs-cids.txt  # pin only BCMR CIDs
      bch-ipfs-scrape --ipfs-pin --ipfs-pin-timeout 10
 
-  8. Combined workflow (export and pin):
-     bch-ipfs-scrape --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+  10. Combined workflow (export and pin):
+      bch-ipfs-scrape --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
 
-  9. Combined workflow (all in one):
-     bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+  11. Full workflow (all in one):
+      bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
 
-  10. Custom authhead.json location:
-      bch-ipfs-scrape --authchain-resolve --authhead-file ./data/authhead.json
-      bch-ipfs-scrape --export IPFS --authhead-file ./data/authhead.json
+  12. Custom result file location:
+      bch-ipfs-scrape --query-chaingraph --chaingraph-result-file ./data/chaingraph.json
+      bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./data/chaingraph.json
 
 Protocol Filters:
   IPFS   - IPFS URIs (ipfs://)
@@ -327,13 +362,18 @@ Protocol Filters:
   ALL    - All URIs regardless of protocol
 
 Environment Variables:
-  CHAINGRAPH_URL    GraphQL endpoint for Chaingraph (required)
-  FULCRUM_WS_URL    Fulcrum WebSocket endpoint for authchain resolution (required)
+  CHAINGRAPH_URL    GraphQL endpoint for Chaingraph (required for --query-chaingraph)
+  FULCRUM_WS_URL    Fulcrum WebSocket endpoint for authchain resolution (required for --authchain-resolve)
   BCMR_WORKDIR      Working directory for all output files (optional)
                     If set, all files/folders will be saved relative to this directory
                     If not set, files are saved in the current working directory
 
 Notes:
+  The new workflow separates Chaingraph querying from authchain resolution.
+  This allows users to:
+    - Use custom Chaingraph queries to influence input data
+    - Inspect/modify Chaingraph results before processing
+    - Re-run authchain resolution without re-querying Chaingraph
   Adjust --concurrency (1-200) to balance server load.
   Use --verbose to see detailed cache hit/miss information per registry.
 `);
@@ -533,7 +573,122 @@ function extractCIDsFromURL(url: string): string[] {
 }
 
 /**
+ * Command: Query Chaingraph and save raw results to file
+ */
+async function doQueryChaingraph(options: {
+  chaingraphQueryFile: string | null;
+  chaingraphResultFile: string;
+}): Promise<void> {
+  const { chaingraphQueryFile, chaingraphResultFile } = options;
+
+  // Default GraphQL query for BCMR outputs
+  const DEFAULT_BCMR_QUERY = `
+  query SearchOutputsByLockingBytecodePrefix {
+    search_output_prefix(
+      args: { locking_bytecode_prefix_hex: "6a0442434d5220" }
+    ) {
+      locking_bytecode
+      output_index
+      transaction_hash
+      value_satoshis
+      transaction {
+        block_inclusions {
+          block {
+            hash
+            height
+          }
+        }
+      }
+      spent_by {
+        input_index
+        transaction {
+          hash
+          block_inclusions {
+            block {
+              hash
+              height
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+  // Load query from file or use default
+  let query: string;
+  if (chaingraphQueryFile) {
+    console.log(`Loading custom Chaingraph query from ${chaingraphQueryFile}...`);
+    if (!existsSync(chaingraphQueryFile)) {
+      console.error(`Error: Query file not found: ${chaingraphQueryFile}`);
+      process.exit(1);
+    }
+    try {
+      query = readFileSync(chaingraphQueryFile, 'utf-8');
+      console.log('Custom query loaded successfully');
+    } catch (error) {
+      console.error(`Error reading query file: ${error instanceof Error ? error.message : error}`);
+      process.exit(1);
+    }
+  } else {
+    console.log('Using default BCMR Chaingraph query...');
+    query = DEFAULT_BCMR_QUERY;
+  }
+
+  const CHAINGRAPH_URL = process.env.CHAINGRAPH_URL || '';
+  if (!CHAINGRAPH_URL) {
+    console.error('Error: CHAINGRAPH_URL environment variable is not set');
+    console.error('Please create a .env file with CHAINGRAPH_URL=<your-chaingraph-url>');
+    process.exit(1);
+  }
+
+  console.log(`Querying Chaingraph at ${CHAINGRAPH_URL}...`);
+
+  try {
+    const response = await fetch(CHAINGRAPH_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        query,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Chaingraph request failed: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json() as {
+      data?: { search_output_prefix?: any[] };
+      errors?: Array<{ message: string }>;
+    };
+
+    if (data.errors) {
+      throw new Error(`GraphQL errors: ${JSON.stringify(data.errors, null, 2)}`);
+    }
+
+    // Save raw result to file
+    const jsonContent = JSON.stringify(data, null, 2);
+    writeFileSync(chaingraphResultFile, jsonContent, 'utf-8');
+
+    console.log(`\n✓ Chaingraph query successful`);
+    console.log(`  Result saved to: ${chaingraphResultFile}`);
+
+    // Show basic statistics if it's the standard query format
+    if (data.data?.search_output_prefix) {
+      const outputs = data.data.search_output_prefix;
+      console.log(`  Found ${outputs.length} BCMR outputs`);
+    }
+  } catch (error) {
+    console.error('Error querying Chaingraph:', error instanceof Error ? error.message : error);
+    process.exit(1);
+  }
+}
+
+/**
  * Command: Resolve authchains and save to authhead.json
+ * Now uses pre-loaded Chaingraph data from file instead of querying
  */
 async function doAuthchainResolve(options: {
   authheadFile: string;
@@ -542,15 +697,42 @@ async function doAuthchainResolve(options: {
   clearCache: boolean;
   verbose: boolean;
   concurrency: number;
+  chaingraphResultFile: string;
 }): Promise<void> {
-  const { authheadFile, jsonFolder, useCache, clearCache, verbose, concurrency } = options;
+  const { authheadFile, jsonFolder, useCache, clearCache, verbose, concurrency, chaingraphResultFile } = options;
 
-  console.log('Fetching BCMR registries from Chaingraph...');
+  // Load Chaingraph data from file
+  console.log(`Loading Chaingraph data from ${chaingraphResultFile}...`);
+
+  if (!existsSync(chaingraphResultFile)) {
+    console.error(`Error: Chaingraph result file not found: ${chaingraphResultFile}`);
+    console.error('Please run --query-chaingraph first to generate the Chaingraph data file.');
+    process.exit(1);
+  }
+
+  let chaingraphData: { data?: { search_output_prefix?: any[] } };
+  try {
+    const fileContent = readFileSync(chaingraphResultFile, 'utf-8');
+    chaingraphData = JSON.parse(fileContent);
+
+    if (!chaingraphData.data?.search_output_prefix) {
+      console.error('Error: Invalid Chaingraph result file format. Expected data.search_output_prefix.');
+      process.exit(1);
+    }
+
+    console.log(`Loaded ${chaingraphData.data.search_output_prefix.length} BCMR outputs from file`);
+  } catch (error) {
+    console.error(`Error reading Chaingraph result file: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+
+  console.log('Resolving authchains...');
   const registries = await getBCMRRegistries({
     useCache,
     cachePath: join(jsonFolder, '.authchain-cache.json'),
     verbose,
     concurrency,
+    chaingraphData,
   });
 
   console.log(`\nFound ${registries.length} total registries`);
@@ -1217,7 +1399,7 @@ async function main(): Promise<void> {
     }
 
     // Show help if requested or no commands specified
-    if (args.showHelp || (!args.authchainResolve && !args.export && !args.exportBcmrIpfsCids && !args.exportCashtokenIpfsCids && !args.fetchJson && !args.ipfsPin)) {
+    if (args.showHelp || (!args.queryChaingraph && !args.authchainResolve && !args.export && !args.exportBcmrIpfsCids && !args.exportCashtokenIpfsCids && !args.fetchJson && !args.ipfsPin)) {
       printUsage();
       process.exit(0);
     }
@@ -1236,13 +1418,15 @@ async function main(): Promise<void> {
     }
 
     // Check for required environment variables (only for commands that need them)
-    if (args.authchainResolve) {
+    if (args.queryChaingraph) {
       if (!process.env.CHAINGRAPH_URL) {
         console.error('Error: CHAINGRAPH_URL environment variable is not set');
         console.error('Please create a .env file with CHAINGRAPH_URL=<your-chaingraph-url>');
         process.exit(1);
       }
+    }
 
+    if (args.authchainResolve) {
       if (!process.env.FULCRUM_WS_URL) {
         console.error('Error: FULCRUM_WS_URL environment variable is not set');
         console.error('Please add FULCRUM_WS_URL=<your-fulcrum-ws-url> to .env file');
@@ -1265,7 +1449,14 @@ async function main(): Promise<void> {
       }
     }
 
-    // Execute commands in order: resolve -> fetch -> export -> pin
+    // Execute commands in order: query -> resolve -> fetch -> export -> pin
+    if (args.queryChaingraph) {
+      await doQueryChaingraph({
+        chaingraphQueryFile: args.chaingraphQueryFile,
+        chaingraphResultFile: args.chaingraphResultFile,
+      });
+    }
+
     if (args.authchainResolve) {
       await doAuthchainResolve({
         authheadFile: args.authheadFile,
@@ -1274,6 +1465,7 @@ async function main(): Promise<void> {
         clearCache: args.clearCache,
         verbose: args.verbose,
         concurrency: args.concurrency,
+        chaingraphResultFile: args.chaingraphResultFile,
       });
     }
 
