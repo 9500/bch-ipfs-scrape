@@ -75,7 +75,9 @@ function parseArgs(): {
   exportBcmrIpfsCids: boolean;
   exportCashtokenIpfsCids: boolean;
   fetchJson: boolean;
+  fetchValidJson: boolean;
   ipfsPin: boolean;
+  ignoreJsonHash: boolean;
   authheadFile: string;
   exportFile: string;
   cidsFile: string;
@@ -83,6 +85,7 @@ function parseArgs(): {
   ipfsPinCidsFile: string | null;
   ipfsPinConcurrency: number;
   jsonFolder: string;
+  jsonConcurrency: number;
   maxFileSizeMB: number;
   ipfsPinTimeout: number;
   useCache: boolean;
@@ -101,7 +104,9 @@ function parseArgs(): {
   let exportBcmrIpfsCids = false;
   let exportCashtokenIpfsCids = false;
   let fetchJson = false;
+  let fetchValidJson = false;
   let ipfsPin = false;
+  let ignoreJsonHash = false;
   let authheadFile = resolveWorkPath('./authhead.json');
   let exportFile = resolveWorkPath('exported-urls.txt');
   let cidsFile = resolveWorkPath('bcmr-ipfs-cids.txt');
@@ -109,6 +114,7 @@ function parseArgs(): {
   let ipfsPinCidsFile: string | null = null; // null = pin both files by default
   let ipfsPinConcurrency = 5; // Default: 5 concurrent pins
   let jsonFolder = resolveWorkPath('./bcmr-registries');
+  let jsonConcurrency = 10; // Default: 10 concurrent downloads
   let maxFileSizeMB = 50; // Default: 50MB
   let ipfsPinTimeout = 5; // Default: 5 seconds
   let useCache = true;
@@ -148,6 +154,18 @@ function parseArgs(): {
       i++;
     } else if (arg === '--fetch-json') {
       fetchJson = true;
+    } else if (arg === '--fetch-valid-json') {
+      fetchValidJson = true;
+    } else if (arg === '--ignore-json-hash') {
+      ignoreJsonHash = true;
+    } else if (arg === '--json-concurrency') {
+      const concurrencyValue = parseInt(args[i + 1]);
+      if (isNaN(concurrencyValue) || concurrencyValue < 1 || concurrencyValue > 200) {
+        console.error('Error: --json-concurrency must be a number between 1 and 200');
+        process.exit(1);
+      }
+      jsonConcurrency = concurrencyValue;
+      i++;
     } else if (arg === '--export-bcmr-ipfs-cids') {
       exportBcmrIpfsCids = true;
     } else if (arg === '--export-cashtoken-ipfs-cids') {
@@ -252,7 +270,9 @@ function parseArgs(): {
     exportBcmrIpfsCids,
     exportCashtokenIpfsCids,
     fetchJson,
+    fetchValidJson,
     ipfsPin,
+    ignoreJsonHash,
     authheadFile,
     exportFile,
     cidsFile,
@@ -260,6 +280,7 @@ function parseArgs(): {
     ipfsPinCidsFile,
     ipfsPinConcurrency,
     jsonFolder,
+    jsonConcurrency,
     maxFileSizeMB,
     ipfsPinTimeout,
     useCache,
@@ -291,7 +312,9 @@ Commands:
   --export <protocols>          Export URLs from authhead.json (IPFS, HTTPS, OTHER, ALL)
   --export-bcmr-ipfs-cids       Export IPFS CIDs from authhead.json (deduplicated, sorted)
   --export-cashtoken-ipfs-cids  Extract IPFS CIDs from BCMR JSON files (deduplicated, sorted)
-  --fetch-json                  Fetch BCMR JSON files from authhead.json
+  --fetch-json                  Fetch BCMR JSON files from authhead.json (no validation)
+  --fetch-valid-json            Fetch and validate BCMR JSON files against BCMR schema
+                                (caches invalid files to avoid re-downloading)
   --ipfs-pin                    Pin IPFS CIDs from both default files using local IPFS daemon
                                 (uses cache to skip already-pinned CIDs)
 
@@ -305,7 +328,10 @@ Options:
   --ipfs-pin-timeout <seconds>  Timeout per CID in seconds (1-600, default: 5)
   --ipfs-pin-concurrency <num>  Parallel pin concurrency (1-200, default: 5)
   --json-folder <path>          Folder for cache and BCMR JSON (default: ./bcmr-registries)
+  --json-concurrency <num>      Parallel JSON download concurrency (1-200, default: 10)
   --max-file-size-mb <num>      Max JSON file size in MB (1-1000, default: 50)
+  --ignore-json-hash            Store JSON files even if hash verification fails
+                                (computed hash still used for validation cache)
   --no-cache                    Disable authchain caching (force full resolution)
   --clear-cache                 Delete cache before running
   --concurrency, -c <num>       Parallel query concurrency (1-200, default: 50)
@@ -337,21 +363,25 @@ Workflow Examples:
   7. Extract IPFS CIDs from BCMR JSON files:
      bch-ipfs-scrape --export-cashtoken-ipfs-cids
 
-  8. Fetch BCMR JSON files:
+  8. Fetch BCMR JSON files (without validation):
      bch-ipfs-scrape --fetch-json
 
-  9. Pin IPFS CIDs using local IPFS daemon (pins from both CID files by default):
-     bch-ipfs-scrape --ipfs-pin
-     bch-ipfs-scrape --ipfs-pin --ipfs-pin-file bcmr-ipfs-cids.txt  # pin only BCMR CIDs
-     bch-ipfs-scrape --ipfs-pin --ipfs-pin-timeout 10
+  9. Fetch and validate BCMR JSON files (with schema validation):
+     bch-ipfs-scrape --fetch-valid-json
+     bch-ipfs-scrape --fetch-valid-json --json-concurrency 20  # faster with more parallelism
 
-  10. Combined workflow (export and pin):
+  10. Pin IPFS CIDs using local IPFS daemon (pins from both CID files by default):
+      bch-ipfs-scrape --ipfs-pin
+      bch-ipfs-scrape --ipfs-pin --ipfs-pin-file bcmr-ipfs-cids.txt  # pin only BCMR CIDs
+      bch-ipfs-scrape --ipfs-pin --ipfs-pin-timeout 10
+
+  11. Combined workflow (export and pin):
       bch-ipfs-scrape --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
 
-  11. Full workflow (all in one):
-      bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+  12. Full workflow with validation (all in one):
+      bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-valid-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
 
-  12. Custom result file location:
+  13. Custom result file location:
       bch-ipfs-scrape --query-chaingraph --chaingraph-result-file ./data/chaingraph.json
       bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./data/chaingraph.json
 
@@ -1292,8 +1322,11 @@ async function doIPFSPin(options: {
 async function doFetchJson(options: {
   authheadFile: string;
   jsonFolder: string;
+  validateSchema?: boolean;
+  ignoreJsonHash?: boolean;
+  concurrency?: number;
 }): Promise<void> {
-  const { authheadFile, jsonFolder } = options;
+  const { authheadFile, jsonFolder, validateSchema = false, ignoreJsonHash = false, concurrency = 10 } = options;
 
   // Load authhead.json
   console.log(`Reading ${authheadFile}...`);
@@ -1307,29 +1340,49 @@ async function doFetchJson(options: {
     throw error;
   }
 
-  console.log(`\nFetching BCMR JSON files (this may take a while)...`);
+  // Load validation cache if schema validation is enabled
+  let validationCache: any = null;
+  const validationCachePath = join(jsonFolder, '.validation-cache.json');
+
+  if (validateSchema) {
+    const { loadValidationCache, createEmptyCache, getCacheStats } = await import('./lib/validation-cache.js');
+    validationCache = loadValidationCache(validationCachePath);
+    const stats = getCacheStats(validationCache);
+
+    if (stats.totalEntries > 0) {
+      console.log(`Loaded validation cache: ${stats.invalidEntries} known-invalid entries`);
+    }
+  }
+
+  console.log(`\nFetching BCMR JSON files${validateSchema ? ' with schema validation' : ''}...`);
+  if (concurrency > 1) {
+    console.log(`Using parallel processing (concurrency: ${concurrency})`);
+  }
 
   let fetchedCount = 0;
   let validCount = 0;
   let failedCount = 0;
   let skippedCount = 0;
+  let schemaInvalidCount = 0;
+  let processedCount = 0;
+  const startTime = Date.now();
 
-  for (let i = 0; i < registries.length; i++) {
-    const registry = registries[i];
-
-    // Show progress
-    if ((i + 1) % 50 === 0) {
-      console.log(`  Processing... ${i + 1}/${registries.length}`);
-    }
-
+  /**
+   * Process a single registry
+   */
+  const processRegistry = async (registry: AuthheadRegistry): Promise<{
+    success: boolean;
+    fetched: boolean;
+    skipped: boolean;
+    schemaInvalid: boolean;
+  }> => {
     // SECURITY: Sanitize tokenId to prevent path traversal attacks
     let safeTokenId: string;
     try {
       safeTokenId = sanitizeTokenId(registry.tokenId);
     } catch (error) {
       console.warn(`Skipping registry with invalid tokenId format: ${error instanceof Error ? error.message : error}`);
-      failedCount++;
-      continue;
+      return { success: false, fetched: false, skipped: false, schemaInvalid: false };
     }
 
     const jsonPath = join(jsonFolder, `${safeTokenId}.json`);
@@ -1344,7 +1397,7 @@ async function doFetchJson(options: {
         if (computedHash === registry.hash) {
           // Hash matches, use existing file (skip network fetch)
           registryJson = sanitizeJSON(JSON.parse(fileContent));
-          skippedCount++;
+          return { success: true, fetched: false, skipped: true, schemaInvalid: false };
         } else {
           // Hash mismatch, file is outdated or corrupted
           console.warn(`Hash mismatch for ${safeTokenId}, refetching...`);
@@ -1358,30 +1411,119 @@ async function doFetchJson(options: {
     // If not found locally or hash mismatch, fetch from network
     if (!registryJson) {
       try {
-        const fetchResult = await fetchAndValidateRegistry(registry.uris, registry.hash);
+        // Get validation cache entry for this hash (if schema validation enabled)
+        // NOTE: We look up by claimed hash from OP_RETURN. If content with this hash
+        // was previously validated, it will be in the cache (since actual == claimed when verified)
+        const validationCacheEntry = validateSchema && validationCache
+          ? validationCache.entries[registry.hash]
+          : null;
 
-        if (fetchResult) {
+        const fetchResult = await fetchAndValidateRegistry(
+          registry.uris,
+          registry.hash,
+          2, // maxRetries
+          2000, // timeoutMs
+          validateSchema,
+          validationCacheEntry,
+          ignoreJsonHash
+        );
+
+        if (fetchResult.success) {
           // Save the raw JSON content (preserves exact formatting and hash)
           writeFileSync(jsonPath, fetchResult.rawContent, 'utf-8');
           registryJson = fetchResult.json;
-          fetchedCount++;
-          validCount++;
+
+          // Update validation cache if schema validation was performed
+          // Cache using the ACTUAL hash of the content (not the claimed hash from OP_RETURN)
+          if (validateSchema && validationCache) {
+            validationCache.entries[fetchResult.computedHash] = {
+              hash: fetchResult.computedHash,
+              url: registry.uris[0] || 'unknown',
+              isValid: true,
+              lastChecked: Date.now(),
+              attemptCount: (validationCacheEntry?.attemptCount || 0) + 1,
+            };
+          }
+
+          return { success: true, fetched: true, skipped: false, schemaInvalid: false };
+        } else if (fetchResult.schemaInvalid) {
+          // Schema validation failed - cache the ACTUAL hash as invalid
+          // This ensures we don't re-download content we know is invalid
+          if (validateSchema && validationCache) {
+            validationCache.entries[fetchResult.computedHash] = {
+              hash: fetchResult.computedHash,
+              url: registry.uris[0] || 'unknown',
+              isValid: false,
+              validationErrors: fetchResult.validationErrors,
+              lastChecked: Date.now(),
+              attemptCount: (validationCacheEntry?.attemptCount || 0) + 1,
+            };
+          }
+
+          return { success: false, fetched: false, skipped: false, schemaInvalid: true };
         } else {
-          failedCount++;
+          // Other failure (network error, hash mismatch, parse error, etc.)
+          // DO NOT cache these - they might be transient errors
+          return { success: false, fetched: false, skipped: false, schemaInvalid: false };
         }
       } catch (error) {
-        failedCount++;
+        return { success: false, fetched: false, skipped: false, schemaInvalid: false };
       }
     } else {
-      validCount++;
+      return { success: true, fetched: false, skipped: false, schemaInvalid: false };
     }
+  };
+
+  /**
+   * Process registries in batches with concurrency control
+   */
+  const processBatch = async (batch: AuthheadRegistry[], batchStartIndex: number): Promise<void> => {
+    const results = await Promise.all(batch.map(registry => processRegistry(registry)));
+
+    // Update counters
+    for (const result of results) {
+      if (result.success) {
+        validCount++;
+        if (result.fetched) fetchedCount++;
+        if (result.skipped) skippedCount++;
+      } else {
+        failedCount++;
+        if (result.schemaInvalid) schemaInvalidCount++;
+      }
+      processedCount++;
+    }
+
+    // Progress reporting
+    if (processedCount % 50 === 0 || processedCount === registries.length) {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      const rate = ((processedCount / (Date.now() - startTime)) * 1000).toFixed(1);
+      console.log(`  Processing... ${processedCount}/${registries.length} (${elapsed}s, ${rate} reg/s)`);
+    }
+  };
+
+  // Process in batches
+  for (let i = 0; i < registries.length; i += concurrency) {
+    const batch = registries.slice(i, i + concurrency);
+    await processBatch(batch, i);
   }
 
-  console.log(`\n✓ BCMR JSON summary:`);
+  // Save validation cache if schema validation was enabled
+  if (validateSchema && validationCache) {
+    const { saveValidationCache } = await import('./lib/validation-cache.js');
+    saveValidationCache(validationCache, validationCachePath);
+    console.log(`\nValidation cache saved to ${validationCachePath}`);
+  }
+
+  const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  console.log(`\n✓ BCMR JSON summary (${totalTime}s):`);
   console.log(`  Fetched from network: ${fetchedCount}`);
   console.log(`  Used local cache: ${skippedCount}`);
   console.log(`  Total valid: ${validCount}`);
   console.log(`  Failed: ${failedCount}`);
+  if (validateSchema && schemaInvalidCount > 0) {
+    console.log(`  Schema validation failures: ${schemaInvalidCount}`);
+  }
   console.log(`  Saved to: ${jsonFolder}/`);
 }
 
@@ -1399,7 +1541,7 @@ async function main(): Promise<void> {
     }
 
     // Show help if requested or no commands specified
-    if (args.showHelp || (!args.queryChaingraph && !args.authchainResolve && !args.export && !args.exportBcmrIpfsCids && !args.exportCashtokenIpfsCids && !args.fetchJson && !args.ipfsPin)) {
+    if (args.showHelp || (!args.queryChaingraph && !args.authchainResolve && !args.export && !args.exportBcmrIpfsCids && !args.exportCashtokenIpfsCids && !args.fetchJson && !args.fetchValidJson && !args.ipfsPin)) {
       printUsage();
       process.exit(0);
     }
@@ -1469,10 +1611,13 @@ async function main(): Promise<void> {
       });
     }
 
-    if (args.fetchJson) {
+    if (args.fetchJson || args.fetchValidJson) {
       await doFetchJson({
         authheadFile: args.authheadFile,
         jsonFolder: args.jsonFolder,
+        validateSchema: args.fetchValidJson,
+        ignoreJsonHash: args.ignoreJsonHash,
+        concurrency: args.jsonConcurrency,
       });
     }
 

@@ -12,6 +12,7 @@ import {
   createEmptyCache,
   getCacheStats,
 } from './authchain-cache.js';
+import { validateBCMRSchema } from './schema-validator.js';
 
 // GraphQL query to fetch all BCMR outputs using prefix search
 const BCMR_QUERY = `
@@ -770,6 +771,14 @@ export function ipfsToGateway(uri: string): string {
 }
 
 /**
+ * Result types for fetchAndValidateRegistry
+ */
+export type FetchValidateResult =
+  | { success: true; json: any; rawContent: string; computedHash: string; hashVerified: boolean }
+  | { success: false; schemaInvalid: true; computedHash: string; validationErrors: string[] }
+  | { success: false; schemaInvalid: false };
+
+/**
  * Fetch and validate a BCMR registry JSON from URIs
  * Tries each URI in order until one succeeds
  *
@@ -777,14 +786,28 @@ export function ipfsToGateway(uri: string): string {
  * @param expectedHash - Expected SHA-256 hash of the JSON content
  * @param maxRetries - Maximum number of retries per URI (default: 2)
  * @param timeoutMs - Timeout in milliseconds (default: 2000)
- * @returns Object with parsed JSON and raw content if valid, null if all attempts fail or hash mismatch
+ * @param validateSchema - Enable JSON schema validation (default: false)
+ * @param validationCacheEntry - Optional validation cache entry for this hash
+ * @param ignoreJsonHash - Store files regardless of hash verification (default: false)
+ * @returns Result object with success status, content, and validation details
  */
 export async function fetchAndValidateRegistry(
   uris: string[],
   expectedHash: string,
   maxRetries: number = 2,
-  timeoutMs: number = 2000
-): Promise<{ json: any; rawContent: string } | null> {
+  timeoutMs: number = 2000,
+  validateSchema: boolean = false,
+  validationCacheEntry?: { hash: string; url: string; isValid: boolean } | null,
+  ignoreJsonHash: boolean = false
+): Promise<FetchValidateResult> {
+  // Check validation cache before attempting download
+  if (validateSchema && validationCacheEntry && !validationCacheEntry.isValid) {
+    console.warn(
+      `Skipping known-invalid JSON from cache: ${validationCacheEntry.hash.substring(0, 12)}... (${validationCacheEntry.url})`
+    );
+    return { success: false, schemaInvalid: false };
+  }
+
   for (const uri of uris) {
     // Convert IPFS URIs to gateway URLs
     const fetchUrl = normalizeUri(uri);
@@ -816,11 +839,20 @@ export async function fetchAndValidateRegistry(
         const computedHash = createHash('sha256').update(rawContent).digest('hex');
 
         // Verify hash matches
-        if (computedHash !== expectedHash) {
-          console.warn(
-            `Hash mismatch for ${fetchUrl}: expected ${expectedHash}, got ${computedHash}`
-          );
-          return null; // Hash mismatch - don't retry, this is invalid
+        const hashVerified = computedHash === expectedHash;
+        if (!hashVerified) {
+          if (ignoreJsonHash) {
+            // Hash mismatch but ignoreJsonHash is enabled - continue processing
+            console.warn(
+              `⚠️  Hash mismatch for ${fetchUrl}: expected ${expectedHash}, got ${computedHash} (continuing due to --ignore-json-hash)`
+            );
+          } else {
+            // Hash mismatch and ignoreJsonHash is disabled - fail
+            console.warn(
+              `Hash mismatch for ${fetchUrl}: expected ${expectedHash}, got ${computedHash}`
+            );
+            return { success: false, schemaInvalid: false }; // Hash mismatch - don't retry
+          }
         }
 
         // Parse JSON
@@ -830,14 +862,35 @@ export async function fetchAndValidateRegistry(
           // Basic structure validation - must have identities object
           if (!json || typeof json !== 'object' || !json.identities) {
             console.warn(`Invalid BCMR structure from ${fetchUrl}: missing identities object`);
-            return null;
+            return { success: false, schemaInvalid: false };
           }
 
-          // Success! Return both parsed JSON and raw content
-          return { json, rawContent };
+          // Schema validation (if enabled)
+          if (validateSchema) {
+            const validation = await validateBCMRSchema(json);
+
+            if (!validation.isValid) {
+              console.warn(`Schema validation failed for ${fetchUrl}:`);
+              // Show first 5 errors for readability
+              validation.errors.slice(0, 5).forEach(err => console.warn(`  - ${err}`));
+              if (validation.errors.length > 5) {
+                console.warn(`  ... and ${validation.errors.length - 5} more errors`);
+              }
+              // Return schema validation failure with actual hash and errors
+              return {
+                success: false,
+                schemaInvalid: true,
+                computedHash,
+                validationErrors: validation.errors
+              };
+            }
+          }
+
+          // Success! Return parsed JSON, raw content, computed hash, and hash verification status
+          return { success: true, json, rawContent, computedHash, hashVerified };
         } catch (parseError) {
           console.warn(`JSON parse error from ${fetchUrl}:`, parseError);
-          return null; // Invalid JSON - don't retry
+          return { success: false, schemaInvalid: false };
         }
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
@@ -859,6 +912,6 @@ export async function fetchAndValidateRegistry(
     }
   }
 
-  // All URIs and retries failed
-  return null;
+  // All URIs and retries failed (network errors, timeouts, etc.)
+  return { success: false, schemaInvalid: false };
 }
