@@ -1,7 +1,7 @@
 {
   "name": "bch-ipfs-scrape",
   "type": "module",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Console app to resolve, export, and fetch Bitcoin Cash Metadata Registry (BCMR) data from the blockchain",
   "main": "dist/index.js",
   "license": "MIT",
