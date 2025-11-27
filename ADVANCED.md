@@ -5,6 +5,7 @@ This document provides detailed technical information about the BCMR Registry To
 ## Table of Contents
 
 - [Project Structure](#project-structure)
+- [Two-Step Workflow](#two-step-workflow)
 - [Authchain Caching](#authchain-caching)
 - [IPFS Pin Caching](#ipfs-pin-caching)
 - [Command Reference](#command-reference)
@@ -27,6 +28,7 @@ This document provides detailed technical information about the BCMR Registry To
 │   ├── .authchain-cache.json     # Authchain resolution cache (auto-generated)
 │   ├── .ipfs-pin-cache.json      # IPFS pin cache (auto-generated)
 │   └── *.json                    # Registry JSON files (with --fetch-json)
+├── chaingraph-result.json        # Raw Chaingraph query results (with --query-chaingraph)
 ├── authhead.json                 # Current registries: active + burned (with --authchain-resolve)
 ├── exported-urls.txt             # Exported URLs (with --export)
 ├── bcmr-ipfs-cids.txt            # Exported IPFS CIDs (with --export-bcmr-ipfs-cids)
@@ -35,6 +37,58 @@ This document provides detailed technical information about the BCMR Registry To
 ├── .env                          # Environment configuration
 ├── package.json                  # Project dependencies and scripts
 └── tsconfig.json                 # TypeScript configuration
+```
+
+## Two-Step Workflow
+
+Starting with version 1.0.0, the tool separates Chaingraph querying from authchain resolution into two distinct steps:
+
+### Step 1: Query Chaingraph (`--query-chaingraph`)
+
+Queries Chaingraph and saves raw results to a file (default: `chaingraph-result.json`).
+
+**Benefits:**
+- **Custom queries** - Provide your own GraphQL query file to influence input data
+- **Inspection** - Review Chaingraph results before processing
+- **Iteration** - Re-run authchain resolution without re-querying Chaingraph
+- **Reduced load** - Avoid redundant Chaingraph queries during development
+
+**Usage:**
+```bash
+# Default BCMR query
+bch-ipfs-scrape --query-chaingraph
+
+# Custom GraphQL query
+bch-ipfs-scrape --query-chaingraph my-custom-query.graphql
+
+# Custom output file location
+bch-ipfs-scrape --query-chaingraph --chaingraph-result-file ./data/results.json
+```
+
+### Step 2: Resolve Authchains (`--authchain-resolve`)
+
+Loads Chaingraph data from the result file and resolves authchains to determine current registry states.
+
+**Requirements:**
+- Must run `--query-chaingraph` first (or have an existing `chaingraph-result.json`)
+- Requires `FULCRUM_WS_URL` in `.env` (does not need `CHAINGRAPH_URL`)
+
+**Usage:**
+```bash
+# Basic usage (uses ./chaingraph-result.json)
+bch-ipfs-scrape --authchain-resolve
+
+# Custom result file location
+bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./data/results.json
+```
+
+### Combined Workflow
+
+You can combine both commands in a single invocation:
+
+```bash
+# Query and resolve in one command
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --ipfs-pin
 ```
 
 ## Authchain Caching
@@ -66,14 +120,14 @@ The tool automatically caches authchain resolution results to avoid redundant bl
 
 **Enable/Disable:**
 ```bash
-# Use cache (default)
-bch-ipfs-scrape --authchain-resolve
+# Use cache (default, requires --query-chaingraph first)
+bch-ipfs-scrape --query-chaingraph --authchain-resolve
 
 # Disable cache (force full resolution)
-bch-ipfs-scrape --authchain-resolve --no-cache
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --no-cache
 
 # Clear cache and start fresh
-bch-ipfs-scrape --authchain-resolve --clear-cache
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --clear-cache
 ```
 
 **Cache Updates:**
@@ -86,7 +140,7 @@ bch-ipfs-scrape --authchain-resolve --clear-cache
 Run with `--verbose` to see detailed cache information:
 
 ```bash
-bch-ipfs-scrape --authchain-resolve --verbose
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --verbose
 ```
 
 Example output:
@@ -177,7 +231,8 @@ rm bcmr-registries/.ipfs-pin-cache.json
 
 | Command | Description | Default | Options |
 |---------|-------------|---------|---------|
-| `--authchain-resolve` | Resolve authchains and save to authhead.json | - | `--verbose`, `--concurrency`, `--no-cache`, `--clear-cache`, `--authhead-file`, `--json-folder` |
+| `--query-chaingraph [file]` | Query Chaingraph and save raw results (required first step). Optional: provide custom GraphQL query file | - | `--chaingraph-result-file` |
+| `--authchain-resolve` | Resolve authchains from Chaingraph result file and save to authhead.json (requires --query-chaingraph first) | - | `--verbose`, `--concurrency`, `--no-cache`, `--clear-cache`, `--authhead-file`, `--json-folder`, `--chaingraph-result-file` |
 | `--export <protocols>` | Export URLs from authhead.json | - | `--authhead-file`, `--export-file` |
 | `--export-bcmr-ipfs-cids` | Export IPFS CIDs from authhead.json | - | `--authhead-file`, `--cids-file` |
 | `--export-cashtoken-ipfs-cids` | Extract IPFS CIDs from BCMR JSON files | - | `--json-folder`, `--cashtoken-cids-file`, `--max-file-size-mb` |
@@ -188,6 +243,7 @@ rm bcmr-registries/.ipfs-pin-cache.json
 
 | Option | Description | Default | Range/Values |
 |--------|-------------|---------|--------------|
+| `--chaingraph-result-file <path>` | Path to save/load Chaingraph results | `./chaingraph-result.json` | Any valid path |
 | `--authhead-file <path>` | Path to authhead.json | `./authhead.json` | Any valid path |
 | `--export-file <filename>` | Export output filename | `exported-urls.txt` | Any filename |
 | `--cids-file <filename>` | BCMR CIDs output filename | `bcmr-ipfs-cids.txt` | Any filename |
@@ -409,14 +465,17 @@ The tool can be tested with different data sources:
 
 ```bash
 # Test with custom Chaingraph endpoint
-CHAINGRAPH_URL=http://test-server:8088/v1/graphql bch-ipfs-scrape --authchain-resolve
+CHAINGRAPH_URL=http://test-server:8088/v1/graphql bch-ipfs-scrape --query-chaingraph --authchain-resolve
+
+# Test with custom GraphQL query
+bch-ipfs-scrape --query-chaingraph custom-query.graphql --authchain-resolve
 
 # Test with different concurrency levels
-bch-ipfs-scrape --authchain-resolve --concurrency 10 --verbose
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --concurrency 10 --verbose
 
 # Test cache behavior
-bch-ipfs-scrape --authchain-resolve --clear-cache --verbose
-bch-ipfs-scrape --authchain-resolve --verbose  # Should show cache hits
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --clear-cache --verbose
+bch-ipfs-scrape --authchain-resolve --verbose  # Should show cache hits (reuses chaingraph-result.json)
 ```
 
 ## Troubleshooting
@@ -450,7 +509,7 @@ bch-ipfs-scrape --authchain-resolve --verbose  # Should show cache hits
 Use `--verbose` flag for detailed diagnostic information:
 
 ```bash
-bch-ipfs-scrape --authchain-resolve --verbose
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --verbose
 bch-ipfs-scrape --ipfs-pin --verbose
 ```
 

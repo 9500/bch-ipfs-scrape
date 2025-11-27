@@ -38,7 +38,7 @@ BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain
 
 4. **Run the tool:**
    ```bash
-   bch-ipfs-scrape --authchain-resolve
+   bch-ipfs-scrape --query-chaingraph --authchain-resolve
    ```
 
 ### Option 2: Build from Source
@@ -64,29 +64,32 @@ BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain
    ```bash
    # Build binary for current system
    npm run pkg:test
-   ./test-binary --authchain-resolve
+   ./test-binary --query-chaingraph --authchain-resolve
 
    # Or build for distribution (both x64 and arm64)
    npm run pkg
-   ./bin/bch-ipfs-scrape-linux-x64 --authchain-resolve
+   ./bin/bch-ipfs-scrape-linux-x64 --query-chaingraph --authchain-resolve
    ```
 
    **Alternatively, run with Node.js:**
    ```bash
    npm run build
-   npm start -- --authchain-resolve
+   npm start -- --query-chaingraph --authchain-resolve
    ```
 
 ### First Run
 
 ```bash
-# Resolve authchains and create authhead.json
+# Step 1: Query Chaingraph and save results (creates chaingraph-result.json)
+bch-ipfs-scrape --query-chaingraph
+
+# Step 2: Resolve authchains and create authhead.json
 bch-ipfs-scrape --authchain-resolve
 
-# Export IPFS URLs
+# Step 3: Export IPFS URLs
 bch-ipfs-scrape --export IPFS
 
-# Fetch registry JSON files
+# Step 4: Fetch registry JSON files
 bch-ipfs-scrape --fetch-json
 ```
 
@@ -102,19 +105,36 @@ bch-ipfs-scrape --fetch-json
 
 ## Basic Commands
 
+### Query Chaingraph
+
+Query Chaingraph and save raw results (required first step):
+
+```bash
+# Query with default BCMR query
+bch-ipfs-scrape --query-chaingraph
+
+# Query with custom GraphQL query file
+bch-ipfs-scrape --query-chaingraph custom-query.graphql
+```
+
+This creates `chaingraph-result.json` containing raw Chaingraph data.
+
 ### Resolve Authchains
 
-Fetch BCMR data and resolve authchains:
+Resolve authchains from Chaingraph results (requires `--query-chaingraph` to be run first):
 
 ```bash
 bch-ipfs-scrape --authchain-resolve
 ```
+
+This loads data from `chaingraph-result.json` and creates `authhead.json`.
 
 Options:
 - `--verbose` - Show detailed logging
 - `--concurrency <num>` - Set parallel query limit (default: 50)
 - `--no-cache` - Disable caching
 - `--clear-cache` - Delete cache before running
+- `--chaingraph-result-file <path>` - Custom path for Chaingraph results (default: ./chaingraph-result.json)
 
 ### Export URLs
 
@@ -189,30 +209,45 @@ Bash script alternative for sequential pinning:
 
 ### Complete Workflow (Recommended)
 
-Resolve authchains, fetch JSON, export CIDs, and pin everything to IPFS:
+Query Chaingraph, resolve authchains, fetch JSON, export CIDs, and pin everything to IPFS:
 
 ```bash
-bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
 ```
 
 This command:
-1. Resolves authchains from blockchain data
-2. Fetches and validates BCMR JSON files
-3. Exports IPFS CIDs from registry metadata
-4. Exports IPFS CIDs from JSON file contents
-5. Pins all CIDs to local IPFS daemon (automatically skips already-pinned CIDs using cache)
+1. Queries Chaingraph and saves raw results
+2. Resolves authchains from Chaingraph data
+3. Fetches and validates BCMR JSON files
+4. Exports IPFS CIDs from registry metadata
+5. Exports IPFS CIDs from JSON file contents
+6. Pins all CIDs to local IPFS daemon (automatically skips already-pinned CIDs using cache)
 
 ### Update Existing Data
 
 Use caching to quickly update (subsequent runs are much faster):
 
 ```bash
-bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
 ```
 
 Cached components:
 - Authchains (only queries new/changed chains)
 - IPFS pins (skips already-pinned CIDs)
+
+### Iterative Development Workflow
+
+After the initial Chaingraph query, you can re-run authchain resolution without re-querying:
+
+```bash
+# First time: Query Chaingraph
+bch-ipfs-scrape --query-chaingraph
+
+# Subsequent runs: Just resolve authchains (much faster)
+bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+```
+
+This is useful for testing or when you want to modify the Chaingraph results before processing.
 
 ### Export and Pin CIDs
 
@@ -231,9 +266,80 @@ bch-ipfs-scrape --ipfs-pin --ipfs-pin-file bcmr-ipfs-cids.txt
 ### Custom Output Files
 
 ```bash
-bch-ipfs-scrape --authchain-resolve \
+bch-ipfs-scrape --query-chaingraph --authchain-resolve \
   --export IPFS,HTTPS --export-file all-urls.txt \
   --export-bcmr-ipfs-cids --cids-file my-cids.txt
+```
+
+## Using Without Chaingraph Access
+
+If you don't have access to a Chaingraph endpoint, you can manually query Chaingraph and use the saved results.
+
+### Manual Chaingraph Query
+
+1. **Visit the public Chaingraph interface:**
+   Open [https://try.chaingraph.cash/](https://try.chaingraph.cash/) in your browser
+
+2. **Execute the following GraphQL query:**
+
+```graphql
+query SearchOutputsByLockingBytecodePrefix {
+  search_output_prefix(
+    args: { locking_bytecode_prefix_hex: "6a0442434d5220" }
+  ) {
+    locking_bytecode
+    output_index
+    transaction_hash
+    value_satoshis
+    transaction {
+      block_inclusions {
+        block {
+          hash
+          height
+        }
+      }
+    }
+    spent_by {
+      input_index
+      transaction {
+        hash
+        block_inclusions {
+          block {
+            hash
+            height
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+3. **Save the JSON response:**
+   Copy the entire JSON response and save it to a file named `chaingraph-result.json` in your working directory
+
+4. **Run authchain resolution with the saved file:**
+
+```bash
+# CHAINGRAPH_URL is NOT required when using a pre-saved file
+# Only FULCRUM_WS_URL is needed in your .env file
+bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+```
+
+**Note:** When using a pre-saved `chaingraph-result.json` file:
+- The `CHAINGRAPH_URL` environment variable is **not required**
+- Only `FULCRUM_WS_URL` is needed for authchain resolution
+- You can skip the `--query-chaingraph` command entirely
+- The tool will automatically load data from the existing `chaingraph-result.json` file
+
+### Custom File Location
+
+If you want to save the result to a different location:
+
+```bash
+# Save your manually queried results to a custom location
+# Then specify it when running authchain resolution:
+bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./my-data/manual-query.json
 ```
 
 ## Working Directory
@@ -259,6 +365,7 @@ When `BCMR_WORKDIR` is not set:
 
 ## Output Files
 
+- `chaingraph-result.json` - Raw Chaingraph query results (created by `--query-chaingraph`)
 - `authhead.json` - Current registries: active + burned, excludes superseded (created by `--authchain-resolve`)
 - `exported-urls.txt` - Exported URLs (created by `--export`)
 - `bcmr-ipfs-cids.txt` - Exported IPFS CIDs from authhead.json (created by `--export-bcmr-ipfs-cids`)
