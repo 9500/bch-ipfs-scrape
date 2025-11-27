@@ -273,52 +273,21 @@ bch-ipfs-scrape --query-chaingraph --authchain-resolve \
 
 ## Using Without Chaingraph Access
 
-If you don't have access to a Chaingraph endpoint, you can manually query Chaingraph and use the saved results.
+If you don't have access to a Chaingraph endpoint, you can download a pre-generated Chaingraph result file.
 
-### Manual Chaingraph Query
+### Download Pre-generated Chaingraph Results
 
-1. **Visit the public Chaingraph interface:**
-   Open [https://try.chaingraph.cash/](https://try.chaingraph.cash/) in your browser
+1. **Download the latest Chaingraph results:**
 
-2. **Execute the following GraphQL query:**
+```bash
+# Download to your working directory
+wget https://ipfs.9500.cash/chaingraph-result.json
 
-```graphql
-query SearchOutputsByLockingBytecodePrefix {
-  search_output_prefix(
-    args: { locking_bytecode_prefix_hex: "6a0442434d5220" }
-  ) {
-    locking_bytecode
-    output_index
-    transaction_hash
-    value_satoshis
-    transaction {
-      block_inclusions {
-        block {
-          hash
-          height
-        }
-      }
-    }
-    spent_by {
-      input_index
-      transaction {
-        hash
-        block_inclusions {
-          block {
-            hash
-            height
-          }
-        }
-      }
-    }
-  }
-}
+# Or use curl
+curl -o chaingraph-result.json https://ipfs.9500.cash/chaingraph-result.json
 ```
 
-3. **Save the JSON response:**
-   Copy the entire JSON response and save it to a file named `chaingraph-result.json` in your working directory
-
-4. **Run authchain resolution with the saved file:**
+2. **Run authchain resolution with the downloaded file:**
 
 ```bash
 # CHAINGRAPH_URL is NOT required when using a pre-saved file
@@ -337,9 +306,11 @@ bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --expor
 If you want to save the result to a different location:
 
 ```bash
-# Save your manually queried results to a custom location
+# Download to custom location
+wget -O ./my-data/chaingraph.json https://ipfs.9500.cash/chaingraph-result.json
+
 # Then specify it when running authchain resolution:
-bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./my-data/manual-query.json
+bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./my-data/chaingraph.json
 ```
 
 ## Working Directory
