@@ -8,6 +8,7 @@ This document provides detailed technical information about the BCMR Registry To
 - [Two-Step Workflow](#two-step-workflow)
 - [Authchain Caching](#authchain-caching)
 - [IPFS Pin Caching](#ipfs-pin-caching)
+- [IPFS Gateway Rewriting](#ipfs-gateway-rewriting)
 - [Command Reference](#command-reference)
 - [Output Formats](#output-formats)
 - [Filtering Rules](#filtering-rules)
@@ -225,6 +226,322 @@ rm bcmr-registries/.ipfs-pin-cache.json
 
 **Note:** Unlike authchain cache, there's no `--clear-pin-cache` flag. Simply delete the file to rebuild the cache from scratch.
 
+## IPFS Gateway Rewriting
+
+### Overview
+
+The IPFS gateway rewriting feature allows you to customize which IPFS gateways are used when fetching BCMR registry files. This is useful for:
+
+- **Using private/local IPFS gateways** - Faster fetching via local nodes or private infrastructure
+- **Gateway redundancy** - Route specific gateways to more reliable alternatives
+- **Cost optimization** - Use free public gateways or self-hosted nodes
+- **Compliance** - Ensure all IPFS traffic routes through approved gateways
+- **Testing** - Point to test gateways during development
+
+### How Gateway Detection Works
+
+The tool automatically detects IPFS gateway URLs from blockchain data using two patterns:
+
+**Path-style gateway URLs:**
+```
+https://ipfs.io/ipfs/QmHash/path/file.json
+         ↑                ↑
+     gateway          CID + path
+```
+
+**Subdomain-style gateway URLs:**
+```
+https://QmHash.ipfs.dweb.link/path/file.json
+         ↑           ↑            ↑
+       CID      .ipfs.   gateway    path
+```
+
+Detection is **structure-based**, not hardcoded. The tool recognizes any domain using these patterns, including:
+- Public gateways (ipfs.io, dweb.link, gateway.pinata.cloud, etc.)
+- Private gateways (192.168.1.100:8080, localhost:8080, etc.)
+- Custom domains (my-ipfs.example.com, etc.)
+
+### Three Gateway Rewriting Modes
+
+#### 1. Default Gateway Configuration
+
+Set which gateway is used for `ipfs://` URLs (blockchain data often uses `ipfs://` scheme).
+
+**Usage:**
+```bash
+bch-ipfs-scrape --fetch-json --ipfs-gateway dweb.link
+```
+
+**Effect:**
+- `ipfs://QmHash/file.json` → `https://dweb.link/ipfs/QmHash/file.json`
+- `https://ipfs.io/ipfs/...` → No change (only affects `ipfs://` conversion)
+
+**Default:** `ipfs.io`
+
+**Supports private IPs:**
+```bash
+bch-ipfs-scrape --fetch-json --ipfs-gateway 192.168.1.100:8080
+```
+
+#### 2. Global Gateway Rewriting
+
+Rewrite **all detected IPFS gateway URLs** to a single target gateway.
+
+**Usage:**
+```bash
+bch-ipfs-scrape --fetch-json --rewrite-gateways --target-gateway gateway.pinata.cloud
+```
+
+**Effect:**
+- `https://ipfs.io/ipfs/QmHash` → `https://gateway.pinata.cloud/ipfs/QmHash`
+- `https://dweb.link/ipfs/QmHash` → `https://gateway.pinata.cloud/ipfs/QmHash`
+- `https://QmHash.ipfs.cloudflare-ipfs.com` → `https://gateway.pinata.cloud/ipfs/QmHash`
+
+**Requirements:**
+- Must specify both `--rewrite-gateways` and `--target-gateway`
+- Target can be private IP (e.g., `localhost:8080`, `192.168.1.100:8080`)
+
+#### 3. Selective Gateway Mapping
+
+Use a JSON file to map specific source gateways to destination gateways. This provides fine-grained control over gateway routing.
+
+**Usage:**
+```bash
+bch-ipfs-scrape --fetch-json --gateway-mapping gateways.json
+```
+
+**Mapping file format (gateways.json):**
+```json
+{
+  "ipfs.io": "dweb.link",
+  "cloudflare-ipfs.com": "gateway.pinata.cloud",
+  "gateway.pinata.cloud": "192.168.1.100:8080"
+}
+```
+
+**Effect:**
+- `https://ipfs.io/ipfs/QmHash` → `https://dweb.link/ipfs/QmHash`
+- `https://cloudflare-ipfs.com/ipfs/QmHash` → `https://gateway.pinata.cloud/ipfs/QmHash`
+- `https://gateway.pinata.cloud/ipfs/QmHash` → `https://192.168.1.100:8080/ipfs/QmHash`
+- `https://other-gateway.com/ipfs/QmHash` → No change (not in mapping)
+
+**Automatic normalization:**
+- Protocol prefixes stripped: `https://ipfs.io` → `ipfs.io`
+- Trailing slashes removed: `ipfs.io/` → `ipfs.io`
+- Case-insensitive matching: `IPFS.IO` → `ipfs.io`
+- Port numbers preserved: `192.168.1.100:8080` stays as-is
+
+### Rewriting Priority
+
+When multiple rewriting options are configured, they are applied in this priority order:
+
+1. **Gateway mapping** (highest priority)
+   - If source gateway matches a mapping entry, use the mapped destination
+
+2. **Global rewrite** (medium priority)
+   - If `--rewrite-gateways` is enabled and no mapping matches, use `--target-gateway`
+
+3. **No change** (lowest priority)
+   - If no rules apply, URL remains unchanged
+
+**Example with multiple rules:**
+```bash
+bch-ipfs-scrape --fetch-json \
+  --ipfs-gateway localhost:8080 \
+  --rewrite-gateways \
+  --target-gateway dweb.link \
+  --gateway-mapping gateways.json
+```
+
+With `gateways.json`:
+```json
+{
+  "ipfs.io": "gateway.pinata.cloud"
+}
+```
+
+**Results:**
+- `ipfs://QmHash` → `https://localhost:8080/ipfs/QmHash` (default gateway)
+- `https://ipfs.io/ipfs/QmHash` → `https://gateway.pinata.cloud/ipfs/QmHash` (mapping wins)
+- `https://cloudflare-ipfs.com/ipfs/QmHash` → `https://dweb.link/ipfs/QmHash` (global rewrite)
+- `https://other.com/ipfs/QmHash` → `https://dweb.link/ipfs/QmHash` (global rewrite)
+- `https://example.com/file.json` → No change (not a gateway URL)
+
+### Output Format
+
+All rewritten URLs are converted to **path-style format** for maximum compatibility:
+
+**Input (various formats):**
+```
+ipfs://QmHash/path
+https://ipfs.io/ipfs/QmHash/path
+https://QmHash.ipfs.dweb.link/path
+```
+
+**Output (always path-style):**
+```
+https://target-gateway.com/ipfs/QmHash/path
+```
+
+This ensures consistent URL formatting regardless of input format.
+
+### Security Considerations
+
+#### User-Configured Gateways Are Trusted
+
+**Private IPs allowed** in gateway configuration:
+- `--ipfs-gateway 192.168.1.100:8080` ✅
+- `--target-gateway localhost:8080` ✅
+- `--gateway-mapping` with private IPs ✅
+
+**Rationale:** User-configured gateways are an explicit choice, not untrusted blockchain data.
+
+#### Blockchain-Sourced URLs Are Validated
+
+**SSRF protection** for URLs from blockchain (before rewriting):
+- Internal/private IPs blocked: `http://localhost`, `http://192.168.1.1` ❌
+- Only standard ports allowed: `https://example.com:8080` ❌
+
+**Rationale:** Blockchain data is untrusted and could contain malicious URLs targeting internal services.
+
+#### Rewriting Bypasses SSRF Checks
+
+After blockchain URLs pass initial validation, gateway rewriting can redirect to private IPs:
+
+1. Blockchain URL validated: `https://ipfs.io/ipfs/QmHash` ✅ (passes SSRF check)
+2. Rewritten to: `https://192.168.1.100:8080/ipfs/QmHash` ✅ (user-configured, trusted)
+
+This design allows using private gateways while protecting against SSRF attacks.
+
+### Complete Usage Examples
+
+#### Use Local IPFS Gateway
+
+```bash
+# Start local IPFS daemon
+ipfs daemon
+
+# Fetch using local gateway (much faster for pinned content)
+bch-ipfs-scrape --fetch-json --ipfs-gateway localhost:8080
+```
+
+#### Route All Traffic Through Private Gateway
+
+```bash
+# Rewrite all IPFS gateway URLs to private infrastructure
+bch-ipfs-scrape --fetch-json \
+  --rewrite-gateways \
+  --target-gateway 192.168.1.100:8080
+```
+
+#### Selective Gateway Routing
+
+Create `gateways.json`:
+```json
+{
+  "ipfs.io": "dweb.link",
+  "cloudflare-ipfs.com": "gateway.pinata.cloud",
+  "slow-gateway.com": "192.168.1.100:8080"
+}
+```
+
+Run:
+```bash
+bch-ipfs-scrape --fetch-json --gateway-mapping gateways.json
+```
+
+#### Combined Configuration
+
+```bash
+# Complex routing setup:
+# - ipfs:// uses local gateway
+# - ipfs.io routes to Pinata
+# - All others route to dweb.link
+bch-ipfs-scrape --fetch-json \
+  --ipfs-gateway localhost:8080 \
+  --rewrite-gateways \
+  --target-gateway dweb.link \
+  --gateway-mapping <(echo '{"ipfs.io":"gateway.pinata.cloud"}')
+```
+
+#### Full Workflow with Gateway Rewriting
+
+```bash
+# Complete workflow using custom gateways
+bch-ipfs-scrape \
+  --query-chaingraph \
+  --authchain-resolve \
+  --fetch-json \
+  --ipfs-gateway localhost:8080 \
+  --rewrite-gateways \
+  --target-gateway dweb.link \
+  --export-bcmr-ipfs-cids \
+  --export-cashtoken-ipfs-cids \
+  --ipfs-pin
+```
+
+### Gateway Mapping File Format
+
+**Basic structure:**
+```json
+{
+  "source-gateway-1": "destination-gateway-1",
+  "source-gateway-2": "destination-gateway-2"
+}
+```
+
+**Valid entries:**
+```json
+{
+  "ipfs.io": "dweb.link",
+  "https://ipfs.io/": "dweb.link",
+  "IPFS.IO": "dweb.link",
+  "192.168.1.100:8080": "localhost:9000",
+  "cloudflare-ipfs.com": "gateway.pinata.cloud"
+}
+```
+
+All entries above normalize to the same source (`ipfs.io`) → destination (`dweb.link`) mapping.
+
+**Invalid entries:**
+```json
+{
+  "ipfs.io": ["dweb.link", "backup.link"],  // ❌ Value must be string
+  "sources": { "ipfs.io": "dweb.link" }      // ❌ Must be flat object
+}
+```
+
+**File validation:**
+- Must be valid JSON
+- Must be an object (not array)
+- All values must be strings
+- Empty sources/destinations rejected after normalization
+
+**Error handling:**
+- File not found: Error and exit
+- Invalid JSON: Error and exit
+- Invalid format: Error with details and exit
+
+### Troubleshooting
+
+**"--rewrite-gateways requires --target-gateway to be specified"**
+- Solution: Add `--target-gateway <domain>` when using `--rewrite-gateways`
+
+**Gateway mapping file not loading:**
+- Check file exists: `ls -la gateways.json`
+- Validate JSON: `cat gateways.json | jq .`
+- Check file permissions
+
+**URLs not being rewritten:**
+- Enable verbose mode: `--verbose`
+- Check URL format matches gateway patterns
+- Verify mapping keys match detected gateway domains (case-insensitive)
+
+**Connection errors with private gateways:**
+- Verify gateway is accessible: `curl http://192.168.1.100:8080/ipfs/QmTest`
+- Check firewall rules
+- Ensure gateway port is correct
+
 ## Command Reference
 
 ### Full Command List
@@ -258,6 +575,10 @@ rm bcmr-registries/.ipfs-pin-cache.json
 | `--concurrency, -c <num>` | Parallel query concurrency | `50` | 1-200 |
 | `--verbose, -v` | Enable verbose logging | false | Flag (no value) |
 | `--help, -h` | Show help message | - | Flag (no value) |
+| `--ipfs-gateway <domain>` | Default gateway for ipfs:// URLs | `ipfs.io` | Any domain or IP:port |
+| `--rewrite-gateways` | Enable global gateway rewriting | false | Flag (requires `--target-gateway`) |
+| `--target-gateway <domain>` | Target gateway for global rewrite | - | Any domain or IP:port |
+| `--gateway-mapping <file>` | JSON file with gateway mappings | - | Path to JSON file |
 
 ### Protocol Filters
 

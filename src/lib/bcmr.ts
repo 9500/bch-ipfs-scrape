@@ -94,6 +94,16 @@ interface BCMRRegistry {
 }
 
 /**
+ * Gateway configuration for IPFS URL rewriting
+ */
+export interface GatewayConfig {
+  defaultGateway: string;           // e.g., "ipfs.io" or "192.168.1.100:8080"
+  rewriteAllGateways: boolean;      // Enable global rewrite
+  targetGateway: string | null;     // Target for global rewrite
+  gatewayMapping: Map<string, string> | null;  // source -> destination mapping
+}
+
+/**
  * Strip PostgreSQL hex prefix (\x) from hex strings
  */
 function stripHexPrefix(hex: string): string {
@@ -745,16 +755,167 @@ function isInternalHostname(hostname: string): boolean {
 }
 
 /**
- * Normalize URI to a clickable HTTP(S) URL
- * - ipfs:// URIs are converted to IPFS gateway URLs
- * - URIs without protocol are assumed to be HTTPS per BCMR spec
- * - http:// and https:// URIs are validated for security
- * SECURITY: Blocks internal/private addresses to prevent SSRF attacks
+ * Result of IPFS gateway detection
  */
-export function normalizeUri(uri: string): string {
+interface IPFSGatewayDetection {
+  isGateway: boolean;
+  gateway: string | null;    // Normalized gateway domain (e.g., "ipfs.io" or "192.168.1.100:8080")
+  cid: string | null;        // Extracted CID
+  pathAfterCid: string;      // Path after CID (including leading /)
+}
+
+/**
+ * Detect if URL uses IPFS gateway and extract gateway domain + CID
+ *
+ * Detects both formats:
+ * - Path style: https://ipfs.io/ipfs/QmHash/path → gateway="ipfs.io"
+ * - Subdomain style: https://QmHash.ipfs.dweb.link/path → gateway="dweb.link"
+ *
+ * @param url - URL string to check
+ * @returns Detection result with gateway domain, CID, and path
+ */
+function detectIPFSGateway(url: string): IPFSGatewayDetection {
+  const notGateway: IPFSGatewayDetection = {
+    isGateway: false,
+    gateway: null,
+    cid: null,
+    pathAfterCid: '',
+  };
+
+  try {
+    const urlObj = new URL(url);
+
+    // Only support http/https protocols
+    if (urlObj.protocol !== 'https:' && urlObj.protocol !== 'http:') {
+      return notGateway;
+    }
+
+    // Check for path-style gateway: /ipfs/{CID}/...
+    const pathMatch = urlObj.pathname.match(/^\/ipfs\/([^\/]+)(\/.*)?$/);
+    if (pathMatch) {
+      const cid = pathMatch[1];
+      const pathAfterCid = pathMatch[2] || '';
+
+      // Validate CID format (basic check - just verify it looks like a CID)
+      if (cid.length < 10 || !/^[a-zA-Z0-9]+$/.test(cid)) {
+        return notGateway;
+      }
+
+      // Extract gateway (hostname with port if present)
+      const gateway = urlObj.port
+        ? `${urlObj.hostname}:${urlObj.port}`.toLowerCase()
+        : urlObj.hostname.toLowerCase();
+
+      return {
+        isGateway: true,
+        gateway,
+        cid,
+        pathAfterCid,
+      };
+    }
+
+    // Check for subdomain-style gateway: {CID}.ipfs.{domain}
+    const subdomainMatch = urlObj.hostname.match(/^([^.]+)\.ipfs\.(.+)$/i);
+    if (subdomainMatch) {
+      const cid = subdomainMatch[1];
+      const baseDomain = subdomainMatch[2];
+
+      // Validate CID format (basic check)
+      if (cid.length < 10 || !/^[a-zA-Z0-9]+$/.test(cid)) {
+        return notGateway;
+      }
+
+      // Extract gateway domain (base domain after .ipfs., with port if present)
+      const gateway = urlObj.port
+        ? `${baseDomain}:${urlObj.port}`.toLowerCase()
+        : baseDomain.toLowerCase();
+
+      // Path after CID is the full pathname
+      const pathAfterCid = urlObj.pathname;
+
+      return {
+        isGateway: true,
+        gateway,
+        cid,
+        pathAfterCid,
+      };
+    }
+
+    // No IPFS gateway pattern detected
+    return notGateway;
+  } catch (e) {
+    // Invalid URL
+    return notGateway;
+  }
+}
+
+/**
+ * Rewrite IPFS gateway URL based on configuration
+ * Priority: gatewayMapping > global rewrite > no change
+ *
+ * @param url - Original URL
+ * @param config - Gateway configuration
+ * @returns Rewritten URL or original if no rewriting applies
+ */
+function rewriteGatewayUrl(url: string, config: GatewayConfig): string {
+  // Detect if this is an IPFS gateway URL
+  const detection = detectIPFSGateway(url);
+
+  if (!detection.isGateway || !detection.gateway || !detection.cid) {
+    // Not a gateway URL, return unchanged
+    return url;
+  }
+
+  let targetGateway: string | null = null;
+
+  // Priority 1: Check gateway mapping (highest priority)
+  if (config.gatewayMapping) {
+    const mapped = config.gatewayMapping.get(detection.gateway);
+    if (mapped) {
+      targetGateway = mapped;
+    }
+  }
+
+  // Priority 2: Check global rewrite
+  if (!targetGateway && config.rewriteAllGateways && config.targetGateway) {
+    targetGateway = config.targetGateway;
+  }
+
+  // If no rewriting applies, return original URL
+  if (!targetGateway) {
+    return url;
+  }
+
+  // Reconstruct URL in path-style format (more compatible)
+  const rewrittenUrl = `https://${targetGateway}/ipfs/${detection.cid}${detection.pathAfterCid}`;
+  return rewrittenUrl;
+}
+
+/**
+ * Normalize URI to a clickable HTTP(S) URL
+ * - ipfs:// URIs are converted to IPFS gateway URLs (configurable gateway)
+ * - URIs without protocol are assumed to be HTTPS per BCMR spec
+ * - http:// and https:// URIs are validated for security and optionally rewritten
+ * SECURITY: Blocks internal/private addresses for blockchain-sourced URLs (before rewriting)
+ * User-configured gateways are trusted and bypass SSRF checks
+ *
+ * @param uri - URI to normalize
+ * @param config - Optional gateway configuration for rewriting
+ * @returns Normalized and optionally rewritten URL
+ */
+export function normalizeUri(uri: string, config?: GatewayConfig): string {
+  // Default configuration
+  const gatewayConfig: GatewayConfig = config || {
+    defaultGateway: 'ipfs.io',
+    rewriteAllGateways: false,
+    targetGateway: null,
+    gatewayMapping: null,
+  };
+
   if (uri.startsWith('ipfs://')) {
     const hash = uri.replace('ipfs://', '');
-    return `https://ipfs.io/ipfs/${hash}`;
+    // Use configurable gateway (may be private IP if user configured it)
+    return `https://${gatewayConfig.defaultGateway}/ipfs/${hash}`;
   }
 
   // If URI already has a protocol
@@ -762,17 +923,22 @@ export function normalizeUri(uri: string): string {
     try {
       const url = new URL(uri);
 
-      // SECURITY: Block internal/private hostnames
+      // SECURITY: Block internal/private hostnames for blockchain-sourced URLs
+      // This check happens BEFORE gateway rewriting
+      // User-configured gateways (from config) are trusted and applied after this check
       if (isInternalHostname(url.hostname)) {
         throw new Error(`Internal/private hostnames not allowed: ${url.hostname}`);
       }
 
       // SECURITY: Only allow standard HTTP(S) ports or no port specified
+      // Exception: gateway rewriting may result in custom ports (which is fine, as it's user-configured)
       if (url.port && !['', '80', '443'].includes(url.port)) {
         throw new Error(`Non-standard ports not allowed: ${url.port}`);
       }
 
-      return uri;
+      // Apply gateway rewriting if configured
+      // This may rewrite to private IPs, which is allowed since it's user-configured
+      return rewriteGatewayUrl(uri, gatewayConfig);
     } catch (error) {
       throw new Error(`Invalid or unsafe URI: ${error instanceof Error ? error.message : error}`);
     }
@@ -788,7 +954,8 @@ export function normalizeUri(uri: string): string {
       throw new Error(`Internal/private hostnames not allowed: ${url.hostname}`);
     }
 
-    return httpsUri;
+    // Apply gateway rewriting if this is an IPFS gateway URL
+    return rewriteGatewayUrl(httpsUri, gatewayConfig);
   } catch (error) {
     throw new Error(`Invalid URI format: ${error instanceof Error ? error.message : error}`);
   }
@@ -829,7 +996,8 @@ export async function fetchAndValidateRegistry(
   timeoutMs: number = 2000,
   validateSchema: boolean = false,
   validationCacheEntry?: { hash: string; url: string; isValid: boolean } | null,
-  ignoreJsonHash: boolean = false
+  ignoreJsonHash: boolean = false,
+  config?: GatewayConfig
 ): Promise<FetchValidateResult> {
   // Check validation cache before attempting download
   if (validateSchema && validationCacheEntry && !validationCacheEntry.isValid) {
@@ -840,8 +1008,8 @@ export async function fetchAndValidateRegistry(
   }
 
   for (const uri of uris) {
-    // Convert IPFS URIs to gateway URLs
-    const fetchUrl = normalizeUri(uri);
+    // Convert IPFS URIs to gateway URLs (with optional gateway rewriting)
+    const fetchUrl = normalizeUri(uri, config);
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {

@@ -5,7 +5,7 @@
  */
 
 import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync, statSync, readdirSync } from 'fs';
-import { getBCMRRegistries, fetchAndValidateRegistry, isValidUrlCharacters } from './lib/bcmr.js';
+import { getBCMRRegistries, fetchAndValidateRegistry, isValidUrlCharacters, type GatewayConfig } from './lib/bcmr.js';
 import { closeConnectionPool } from './lib/fulcrum-client.js';
 import * as dotenv from 'dotenv';
 import { join } from 'path';
@@ -66,6 +66,80 @@ interface AuthheadRegistry {
 }
 
 /**
+ * Normalize gateway domain by removing protocols and trailing slashes
+ * @param gateway - Gateway domain (may include https://, http://, or trailing /)
+ * @returns Normalized gateway domain (e.g., "ipfs.io" or "192.168.1.100:8080")
+ */
+function normalizeGatewayDomain(gateway: string): string {
+  let normalized = gateway.trim();
+
+  // Strip https:// and http:// prefixes
+  normalized = normalized.replace(/^https?:\/\//, '');
+
+  // Strip trailing slashes
+  normalized = normalized.replace(/\/+$/, '');
+
+  // Convert to lowercase for case-insensitive matching
+  normalized = normalized.toLowerCase();
+
+  return normalized;
+}
+
+/**
+ * Load gateway mapping from JSON file
+ * Format: { "source-gateway.com": "dest-gateway.com" }
+ * Automatically normalizes domains (strips https://, http://, trailing /)
+ * Supports private IPs and localhost in destinations (user-configured = trusted)
+ * @param filepath - Path to JSON mapping file
+ * @returns Map of source gateway -> destination gateway
+ */
+function loadGatewayMapping(filepath: string): Map<string, string> {
+  // Check file exists
+  if (!existsSync(filepath)) {
+    throw new Error(`Gateway mapping file not found: ${filepath}`);
+  }
+
+  // Read and parse JSON
+  const content = readFileSync(filepath, 'utf-8');
+  let json: unknown;
+
+  try {
+    json = JSON.parse(content);
+  } catch (e) {
+    throw new Error(`Invalid JSON in gateway mapping file: ${filepath}`);
+  }
+
+  // Validate it's an object (not array)
+  if (typeof json !== 'object' || json === null || Array.isArray(json)) {
+    throw new Error(`Gateway mapping must be a JSON object, not array or primitive`);
+  }
+
+  // Build mapping with normalized keys and values
+  const mapping = new Map<string, string>();
+
+  for (const [source, dest] of Object.entries(json)) {
+    if (typeof dest !== 'string') {
+      throw new Error(`Gateway mapping values must be strings. Invalid value for "${source}": ${dest}`);
+    }
+
+    const normalizedSource = normalizeGatewayDomain(source);
+    const normalizedDest = normalizeGatewayDomain(dest);
+
+    if (normalizedSource.length === 0) {
+      throw new Error(`Empty source gateway after normalization: "${source}"`);
+    }
+
+    if (normalizedDest.length === 0) {
+      throw new Error(`Empty destination gateway after normalization: "${dest}"`);
+    }
+
+    mapping.set(normalizedSource, normalizedDest);
+  }
+
+  return mapping;
+}
+
+/**
  * Parse command line arguments
  */
 function parseArgs(): {
@@ -96,6 +170,10 @@ function parseArgs(): {
   showVersion: boolean;
   chaingraphQueryFile: string | null;
   chaingraphResultFile: string;
+  ipfsGateway: string;
+  rewriteGateways: boolean;
+  targetGateway: string | null;
+  gatewayMappingFile: string | null;
 } {
   const args = process.argv.slice(2);
   let authchainResolve = false;
@@ -125,6 +203,10 @@ function parseArgs(): {
   let showVersion = false;
   let chaingraphQueryFile: string | null = null;
   let chaingraphResultFile = resolveWorkPath('./chaingraph-result.json');
+  let ipfsGateway = 'ipfs.io'; // Default IPFS gateway
+  let rewriteGateways = false;
+  let targetGateway: string | null = null;
+  let gatewayMappingFile: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -252,6 +334,29 @@ function parseArgs(): {
       }
       maxFileSizeMB = maxSizeValue;
       i++;
+    } else if (arg === '--ipfs-gateway') {
+      ipfsGateway = args[i + 1];
+      if (!ipfsGateway) {
+        console.error('Error: --ipfs-gateway requires a gateway domain');
+        process.exit(1);
+      }
+      i++;
+    } else if (arg === '--rewrite-gateways') {
+      rewriteGateways = true;
+    } else if (arg === '--target-gateway') {
+      targetGateway = args[i + 1];
+      if (!targetGateway) {
+        console.error('Error: --target-gateway requires a gateway domain');
+        process.exit(1);
+      }
+      i++;
+    } else if (arg === '--gateway-mapping') {
+      gatewayMappingFile = args[i + 1];
+      if (!gatewayMappingFile) {
+        console.error('Error: --gateway-mapping requires a file path');
+        process.exit(1);
+      }
+      i++;
     } else if (arg === '--version') {
       showVersion = true;
     } else if (arg === '--help' || arg === '-h') {
@@ -291,6 +396,10 @@ function parseArgs(): {
     showVersion,
     chaingraphQueryFile,
     chaingraphResultFile,
+    ipfsGateway,
+    rewriteGateways,
+    targetGateway,
+    gatewayMappingFile,
   };
 }
 
@@ -339,6 +448,13 @@ Options:
   --version                     Show version number
   --help, -h                    Show this help message
 
+Gateway Rewriting Options:
+  --ipfs-gateway <domain>       Set default gateway for ipfs:// URLs (default: ipfs.io)
+                                Supports private IPs (e.g., 192.168.1.100:8080)
+  --rewrite-gateways            Enable rewriting all detected IPFS gateways
+  --target-gateway <domain>     Target gateway for global rewrite (required with --rewrite-gateways)
+  --gateway-mapping <file>      JSON file with source→dest gateway mappings
+
 Workflow Examples:
 
   1. New two-step workflow (query then resolve):
@@ -384,6 +500,23 @@ Workflow Examples:
   13. Custom result file location:
       bch-ipfs-scrape --query-chaingraph --chaingraph-result-file ./data/chaingraph.json
       bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./data/chaingraph.json
+
+  14. Use custom default gateway for ipfs:// URLs:
+      bch-ipfs-scrape --fetch-json --ipfs-gateway dweb.link
+
+  15. Use private IPFS gateway:
+      bch-ipfs-scrape --fetch-json --ipfs-gateway 192.168.1.100:8080
+
+  16. Rewrite all gateways to a single target:
+      bch-ipfs-scrape --fetch-json --rewrite-gateways --target-gateway gateway.pinata.cloud
+
+  17. Selective gateway rewriting with mapping file:
+      bch-ipfs-scrape --fetch-json --gateway-mapping gateways.json
+      # Example gateways.json format:
+      # {
+      #   "ipfs.io": "dweb.link",
+      #   "cloudflare-ipfs.com": "192.168.1.100:8080"
+      # }
 
 Protocol Filters:
   IPFS   - IPFS URIs (ipfs://)
@@ -1331,8 +1464,9 @@ async function doFetchJson(options: {
   validateSchema?: boolean;
   ignoreJsonHash?: boolean;
   concurrency?: number;
+  config?: GatewayConfig;
 }): Promise<void> {
-  const { authheadFile, jsonFolder, validateSchema = false, ignoreJsonHash = false, concurrency = 10 } = options;
+  const { authheadFile, jsonFolder, validateSchema = false, ignoreJsonHash = false, concurrency = 10, config } = options;
 
   // Load authhead.json
   console.log(`Reading ${authheadFile}...`);
@@ -1431,7 +1565,8 @@ async function doFetchJson(options: {
           2000, // timeoutMs
           validateSchema,
           validationCacheEntry,
-          ignoreJsonHash
+          ignoreJsonHash,
+          config
         );
 
         if (fetchResult.success) {
@@ -1597,6 +1732,44 @@ async function main(): Promise<void> {
       }
     }
 
+    // Validate and build gateway configuration
+    if (args.rewriteGateways && !args.targetGateway) {
+      console.error('Error: --rewrite-gateways requires --target-gateway to be specified');
+      process.exit(1);
+    }
+
+    // Load gateway mapping if specified
+    let gatewayMapping: Map<string, string> | null = null;
+    if (args.gatewayMappingFile) {
+      try {
+        gatewayMapping = loadGatewayMapping(args.gatewayMappingFile);
+        console.log(`Loaded gateway mapping from ${args.gatewayMappingFile} (${gatewayMapping.size} mappings)`);
+      } catch (error) {
+        console.error(`Error loading gateway mapping: ${error instanceof Error ? error.message : error}`);
+        process.exit(1);
+      }
+    }
+
+    // Build gateway configuration
+    const gatewayConfig = {
+      defaultGateway: normalizeGatewayDomain(args.ipfsGateway),
+      rewriteAllGateways: args.rewriteGateways,
+      targetGateway: args.targetGateway ? normalizeGatewayDomain(args.targetGateway) : null,
+      gatewayMapping,
+    };
+
+    // Log gateway configuration if non-default
+    if (args.ipfsGateway !== 'ipfs.io' || args.rewriteGateways || gatewayMapping) {
+      console.log('Gateway configuration:');
+      console.log(`  Default gateway: ${gatewayConfig.defaultGateway}`);
+      if (args.rewriteGateways && gatewayConfig.targetGateway) {
+        console.log(`  Rewriting all gateways to: ${gatewayConfig.targetGateway}`);
+      }
+      if (gatewayMapping) {
+        console.log(`  Using selective mapping (${gatewayMapping.size} rules)`);
+      }
+    }
+
     // Execute commands in order: query -> resolve -> fetch -> export -> pin
     if (args.queryChaingraph) {
       await doQueryChaingraph({
@@ -1624,6 +1797,7 @@ async function main(): Promise<void> {
         validateSchema: args.fetchValidJson,
         ignoreJsonHash: args.ignoreJsonHash,
         concurrency: args.jsonConcurrency,
+        config: gatewayConfig,
       });
     }
 
