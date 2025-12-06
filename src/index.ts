@@ -5,7 +5,7 @@
  */
 
 import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync, statSync, readdirSync } from 'fs';
-import { getBCMRRegistries, fetchAndValidateRegistry } from './lib/bcmr.js';
+import { getBCMRRegistries, fetchAndValidateRegistry, isValidUrlCharacters } from './lib/bcmr.js';
 import { closeConnectionPool } from './lib/fulcrum-client.js';
 import * as dotenv from 'dotenv';
 import { join } from 'path';
@@ -14,7 +14,7 @@ import { execSync, spawn } from 'child_process';
 import { CID } from 'multiformats/cid';
 
 // Get package version (works in both ESM and bundled CommonJS)
-let VERSION = '1.0.0'; // Fallback version
+let VERSION = '1.0.2'; // Fallback version
 try {
   // Try to read from package.json (works when running from source)
   const packageJsonPath = new URL('../package.json', import.meta.url);
@@ -560,6 +560,11 @@ function isValidIPFSCID(cid: string): boolean {
 function extractCIDsFromURL(url: string): string[] {
   const cids: string[] = [];
 
+  // Validate URL contains only valid characters
+  if (!isValidUrlCharacters(url)) {
+    return [];
+  }
+
   try {
     // Skip IPNS URLs (we only want IPFS CIDs)
     if (url.includes('/ipns/') || url.includes('.ipns.')) {
@@ -950,6 +955,7 @@ function extractIPFSCIDsFromJSON(
     }
 
     // Check if string contains IPFS CIDs (ipfs:// or HTTPS gateway URLs)
+    // Note: extractCIDsFromURL() handles validation, no need to validate here
     if (json.startsWith('ipfs://') || json.startsWith('http://') || json.startsWith('https://')) {
       const extractedCids = extractCIDsFromURL(json);
       for (const cid of extractedCids) {

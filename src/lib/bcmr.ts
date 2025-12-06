@@ -108,6 +108,36 @@ function stripHexPrefix(hex: string): string {
 }
 
 /**
+ * Maximum allowed URL length (characters)
+ * Conservative limit to prevent abuse and ensure compatibility
+ */
+const MAX_URL_LENGTH = 2048;
+
+/**
+ * Validate URL contains only valid characters per RFC 3986 and is within length limit
+ * Rejects URLs with control characters, null bytes, or other invalid content
+ *
+ * Valid characters:
+ * - Alphanumeric: a-z A-Z 0-9
+ * - Unreserved: - . _ ~
+ * - Reserved: : / ? # [ ] @ ! $ & ' ( ) * + , ; = %
+ *
+ * @param url - URL string to validate
+ * @returns true if URL contains only valid characters and is within length limit
+ */
+export function isValidUrlCharacters(url: string): boolean {
+  // Check length limit
+  if (url.length === 0 || url.length > MAX_URL_LENGTH) {
+    return false;
+  }
+
+  // RFC 3986 compliant character set
+  // This rejects control characters, null bytes, and other binary garbage
+  const validUrlPattern = /^[a-zA-Z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+$/;
+  return validUrlPattern.test(url);
+}
+
+/**
  * Parse BCMR locking bytecode to extract hash and URIs
  */
 function parseBCMRBytecode(hex: string): ParsedBCMR | null {
@@ -171,8 +201,9 @@ function parseBCMRBytecode(hex: string): ParsedBCMR | null {
       const uriBytes = bytes.slice(pos, pos + pushLength);
       try {
         const uri = uriBytes.toString('utf8').trim();
-        // Per BCMR spec: accept all non-empty URIs (protocol-less URIs assume HTTPS)
-        if (uri.length > 0) {
+        // Validate URI: must be non-empty and contain only valid URL characters
+        // This filters out malformed URLs with control characters, null bytes, etc.
+        if (uri.length > 0 && isValidUrlCharacters(uri)) {
           uris.push(uri);
         }
       } catch (e) {
