@@ -11,7 +11,11 @@
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
     "pkg": "npm run bundle && pkg dist/bundled.cjs --compress GZip",
-    "pkg:test": "npm run bundle && pkg dist/bundled.cjs --targets node20-linux-x64 --compress GZip --output test-binary"
+    "pkg:test": "npm run bundle && pkg dist/bundled.cjs --targets node20-linux-x64 --compress GZip --output test-binary",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest run --coverage"
   },
   "bin": {
     "bch-ipfs-scrape": "dist/index.js"
@@ -33,8 +37,10 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/ws": "^8.5.10",
+    "@vitest/ui": "^4.0.15",
     "@yao-pkg/pkg": "^6.10.1",
     "esbuild": "^0.24.2",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^4.0.15"
   }
 }
