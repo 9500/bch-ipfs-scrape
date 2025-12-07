@@ -139,6 +139,47 @@ test(
   }
 );
 
+test(
+  '--query-chaingraph with custom query limits results to 1000',
+  { skip: shouldSkip, timeout: 30000 },
+  async () => {
+    const customQueryPath = join(
+      projectRoot,
+      'tests/fixtures/chaingraph/limit-1000-query.graphql'
+    );
+
+    // Execute CLI with custom query file
+    const { stdout } = await execFileAsync(
+      'node',
+      [
+        cliPath,
+        '--query-chaingraph',
+        customQueryPath,
+        '--chaingraph-result-file',
+        testOutputFile,
+      ],
+      {
+        env: { ...process.env },
+        cwd: projectRoot,
+      }
+    );
+
+    // Verify output mentions custom query was loaded
+    expect(stdout).toContain('Custom query loaded successfully');
+
+    // Parse result
+    const resultJson = JSON.parse(readFileSync(testOutputFile, 'utf-8'));
+
+    // Verify exactly 1000 results (not more, not less)
+    const registries = resultJson.data.search_output_prefix;
+    expect(registries.length).toBe(1000);
+
+    console.log(
+      `  ✓ Custom query correctly limited to ${registries.length} registries`
+    );
+  }
+);
+
 // Show helpful message if tests are skipped
 if (shouldSkip) {
   console.log('\n⚠️  Chaingraph tests skipped: CHAINGRAPH_URL not set in .env file\n');

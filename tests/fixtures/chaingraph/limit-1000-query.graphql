@@ -1,0 +1,31 @@
+query SearchOutputsByLockingBytecodePrefix {
+  search_output_prefix(
+    args: { locking_bytecode_prefix_hex: "6a0442434d5220" }
+    limit: 1000
+  ) {
+    locking_bytecode
+    output_index
+    transaction_hash
+    value_satoshis
+    transaction {
+      block_inclusions {
+        block {
+          hash
+          height
+        }
+      }
+    }
+    spent_by {
+      input_index
+      transaction {
+        hash
+        block_inclusions {
+          block {
+            hash
+            height
+          }
+        }
+      }
+    }
+  }
+}
