@@ -1010,6 +1010,7 @@ export async function fetchAndValidateRegistry(
   for (const uri of uris) {
     // Convert IPFS URIs to gateway URLs (with optional gateway rewriting)
     const fetchUrl = normalizeUri(uri, config);
+    const urlDisplay = uri !== fetchUrl ? `${uri} → ${fetchUrl}` : uri;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -1026,7 +1027,7 @@ export async function fetchAndValidateRegistry(
 
         if (!response.ok) {
           console.warn(
-            `Failed to fetch ${fetchUrl} (attempt ${attempt}/${maxRetries}): HTTP ${response.status}`
+            `Failed to fetch ${urlDisplay} (attempt ${attempt}/${maxRetries}): HTTP ${response.status}`
           );
           continue;
         }
@@ -1043,12 +1044,12 @@ export async function fetchAndValidateRegistry(
           if (ignoreJsonHash) {
             // Hash mismatch but ignoreJsonHash is enabled - continue processing
             console.warn(
-              `⚠️  Hash mismatch for ${fetchUrl}: expected ${expectedHash}, got ${computedHash} (continuing due to --ignore-json-hash)`
+              `⚠️  Hash mismatch for ${urlDisplay}: expected ${expectedHash}, got ${computedHash} (continuing due to --ignore-json-hash)`
             );
           } else {
             // Hash mismatch and ignoreJsonHash is disabled - fail
             console.warn(
-              `Hash mismatch for ${fetchUrl}: expected ${expectedHash}, got ${computedHash}`
+              `Hash mismatch for ${urlDisplay}: expected ${expectedHash}, got ${computedHash}`
             );
             return { success: false, schemaInvalid: false }; // Hash mismatch - don't retry
           }
@@ -1060,7 +1061,7 @@ export async function fetchAndValidateRegistry(
 
           // Basic structure validation - must have identities object
           if (!json || typeof json !== 'object' || !json.identities) {
-            console.warn(`Invalid BCMR structure from ${fetchUrl}: missing identities object`);
+            console.warn(`Invalid BCMR structure from ${urlDisplay}: missing identities object`);
             return { success: false, schemaInvalid: false };
           }
 
@@ -1069,7 +1070,7 @@ export async function fetchAndValidateRegistry(
             const validation = await validateBCMRSchema(json);
 
             if (!validation.isValid) {
-              console.warn(`Schema validation failed for ${fetchUrl}:`);
+              console.warn(`Schema validation failed for ${urlDisplay}:`);
               // Show first 5 errors for readability
               validation.errors.slice(0, 5).forEach(err => console.warn(`  - ${err}`));
               if (validation.errors.length > 5) {
@@ -1088,17 +1089,17 @@ export async function fetchAndValidateRegistry(
           // Success! Return parsed JSON, raw content, computed hash, and hash verification status
           return { success: true, json, rawContent, computedHash, hashVerified };
         } catch (parseError) {
-          console.warn(`JSON parse error from ${fetchUrl}:`, parseError);
+          console.warn(`JSON parse error from ${urlDisplay}:`, parseError);
           return { success: false, schemaInvalid: false };
         }
       } catch (error) {
         if (error instanceof Error && error.name === 'AbortError') {
           console.warn(
-            `Timeout fetching ${fetchUrl} (attempt ${attempt}/${maxRetries})`
+            `Timeout fetching ${urlDisplay} (attempt ${attempt}/${maxRetries})`
           );
         } else {
           console.warn(
-            `Error fetching ${fetchUrl} (attempt ${attempt}/${maxRetries}):`,
+            `Error fetching ${urlDisplay} (attempt ${attempt}/${maxRetries}):`,
             error instanceof Error ? error.message : error
           );
         }
