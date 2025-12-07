@@ -41,7 +41,8 @@ test(
   { skip: shouldSkip, timeout: 60000 },
   async () => {
     // Execute the CLI with --authchain-resolve using sample fixture
-    const { stdout } = await execFileAsync(
+    // Note: Must destructure stderr to avoid buffer issues with execFileAsync
+    const { stdout, stderr: _stderr1 } = await execFileAsync(
       'node',
       [
         cliPath,
@@ -50,10 +51,13 @@ test(
         inputFixture,
         '--authhead-file',
         testOutputFile,
+        '--concurrency',
+        '5', // Reduce concurrency to avoid overwhelming Fulcrum server
       ],
       {
         env: { ...process.env },
         cwd: projectRoot,
+        maxBuffer: 50 * 1024 * 1024, // 50MB buffer for large outputs
       }
     );
 
@@ -81,7 +85,7 @@ test(
   { skip: shouldSkip, timeout: 60000 },
   async () => {
     // Execute the CLI with --authchain-resolve
-    await execFileAsync(
+    const { stdout: _stdout2, stderr: _stderr2 } = await execFileAsync(
       'node',
       [
         cliPath,
@@ -90,10 +94,13 @@ test(
         inputFixture,
         '--authhead-file',
         testOutputFile,
+        '--concurrency',
+        '5', // Reduce concurrency to avoid overwhelming Fulcrum server
       ],
       {
         env: { ...process.env },
         cwd: projectRoot,
+        maxBuffer: 50 * 1024 * 1024, // 50MB buffer for large outputs
       }
     );
 

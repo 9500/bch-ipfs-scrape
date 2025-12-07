@@ -34,5 +34,8 @@ export default defineConfig({
 
     // Watch mode settings
     watch: false, // Don't run in watch mode by default
+
+    // Run test files sequentially to avoid Fulcrum connection pool exhaustion
+    fileParallelism: false,
   },
 });
