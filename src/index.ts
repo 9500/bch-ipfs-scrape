@@ -14,7 +14,7 @@ import { execSync, spawn } from 'child_process';
 import { CID } from 'multiformats/cid';
 
 // Get package version (works in both ESM and bundled CommonJS)
-let VERSION = '1.0.2'; // Fallback version
+let VERSION = '1.0.3'; // Fallback version
 try {
   // Try to read from package.json (works when running from source)
   const packageJsonPath = new URL('../package.json', import.meta.url);
@@ -70,11 +70,11 @@ interface AuthheadRegistry {
  * @param gateway - Gateway domain (may include https://, http://, or trailing /)
  * @returns Normalized gateway domain (e.g., "ipfs.io" or "192.168.1.100:8080")
  */
-function normalizeGatewayDomain(gateway: string): string {
+export function normalizeGatewayDomain(gateway: string): string {
   let normalized = gateway.trim();
 
-  // Strip https:// and http:// prefixes
-  normalized = normalized.replace(/^https?:\/\//, '');
+  // Strip https:// and http:// prefixes (case-insensitive)
+  normalized = normalized.replace(/^https?:\/\//i, '');
 
   // Strip trailing slashes
   normalized = normalized.replace(/\/+$/, '');
@@ -93,7 +93,7 @@ function normalizeGatewayDomain(gateway: string): string {
  * @param filepath - Path to JSON mapping file
  * @returns Map of source gateway -> destination gateway
  */
-function loadGatewayMapping(filepath: string): Map<string, string> {
+export function loadGatewayMapping(filepath: string): Map<string, string> {
   // Check file exists
   if (!existsSync(filepath)) {
     throw new Error(`Gateway mapping file not found: ${filepath}`);
