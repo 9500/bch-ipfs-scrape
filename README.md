@@ -158,11 +158,11 @@ bch-ipfs-scrape --query-chaingraph --authchain-resolve \
   --export-bcmr-ipfs-cids --cids-file my-cids.txt
 ```
 
-## Using Without Chaingraph Access
+## Using Without Chaingraph or Fulcrum Access
 
-If you don't have access to a Chaingraph endpoint, you can download a pre-generated Chaingraph result file.
+If you don't have access to a Chaingraph or Fulcrum endpoint, you can download a pre-generated Chaingraph result file or already resolved authhead.json. Hosted files and generated on a relatively frequent schedule.
 
-### Download Pre-generated Chaingraph Results
+### Download Pre-generated Chaingraph Results to run without Chaingraph access
 
 1. **Download the latest Chaingraph results:**
 
@@ -185,8 +185,34 @@ bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --expor
 **Note:** When using a pre-saved `chaingraph-result.json` file:
 - The `CHAINGRAPH_URL` environment variable is **not required**
 - Only `FULCRUM_WS_URL` is needed for authchain resolution
-- You can skip the `--query-chaingraph` command entirely
+- You can skip the `--query-chaingraph` parameter entirely
 - The tool will automatically load data from the existing `chaingraph-result.json` file
+
+### Download Pre-generated authhead.json to run without both Chaingraph or Fulcrum access
+
+1. **Download the latest authhead.json:**
+```bash
+# Download to your working directory
+wget https://ipfs.9500.cash/authhead.json
+
+# Or use curl
+curl -o authhead.json https://ipfs.9500.cash/authhead.json
+```
+
+2. **Run any other command with the downloaded authhead.json file:**
+
+```bash
+# CHAINGRAPH_URL is NOT required when running the tool without --query-chaingraph parameter
+# FULCRUM_WS_URL is NOT required when running the tool without --authchain-resolve parameter
+bch-ipfs-scrape --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+```
+
+**Note:** When using a pre-saved `authhead.json` file:
+- The `CHAINGRAPH_URL` environment variable is **not required**
+- The `FULCRUM_WS_URL` environment variable is **not required**
+- You can skip the `--query-chaingraph` and `--authchain-resolve` parameters entirely
+- The tool will automatically load data from the existing `authhead.json` file
+
 
 ### Custom File Location
 
@@ -209,6 +235,7 @@ bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./my-data/chaingrap
 - **IPFS Pinning** - Pin CIDs from both sources using local IPFS daemon
 - **Caching** - Automatically caches authchain resolution to speed up subsequent runs
 - **Parallel Processing** - Configurable concurrency for blockchain queries
+- **IPFS Gateway URL Rewriting** - Specify custom IPFS gateway to use (see [ADVANCED.md](ADVANCED.md))
 
 ## Basic Commands
 
