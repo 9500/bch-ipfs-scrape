@@ -4,7 +4,7 @@ A Node.js tool for resolving, exporting, and fetching Bitcoin Cash Metadata Regi
 
 ## What is BCMR?
 
-BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain metadata about Bitcoin Cash tokens and identities. This tool queries the blockchain to find BCMR announcements, resolves authchains to find current registry states, and provides commands to export URLs and fetch registry JSON files.
+BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain metadata about Bitcoin Cash tokens and identities. This tool queries the blockchain to find BCMR announcements, resolves authchains to find current registry states, and provides commands fetch registry JSON files. It can export URLs or IPFS CIDs from the BCMR announcements and/or registry JSON files. The purpose of the tool is to allow easy pinning of the BCH metadata to the self-hosted IPFS node/gateway.
 
 ## Quick Start
 
@@ -62,11 +62,7 @@ BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain
 
 4. **Build standalone binary:**
    ```bash
-   # Build binary for current system
-   npm run pkg:test
-   ./test-binary --query-chaingraph --authchain-resolve
-
-   # Or build for distribution (both x64 and arm64)
+   # Build binary for both x64 and arm64
    npm run pkg
    ./bin/bch-ipfs-scrape-linux-x64 --query-chaingraph --authchain-resolve
    ```
@@ -86,11 +82,122 @@ bch-ipfs-scrape --query-chaingraph
 # Step 2: Resolve authchains and create authhead.json
 bch-ipfs-scrape --authchain-resolve
 
-# Step 3: Export IPFS URLs
-bch-ipfs-scrape --export IPFS
-
-# Step 4: Fetch registry JSON files
+# Step 3: Fetch registry JSON files
 bch-ipfs-scrape --fetch-json
+
+# Step 4: Export CIDs and URLs
+bch-ipfs-scrape --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids
+bch-ipfs-scrape --export IPFS,HTTPS
+```
+
+## Common Workflows
+
+### Complete Workflow (Recommended)
+
+Query Chaingraph, resolve authchains, fetch JSON, export CIDs, and pin everything to IPFS:
+
+```bash
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-valid-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+```
+
+This command:
+1. Queries Chaingraph and saves raw results
+2. Resolves authchains from Chaingraph data
+3. Fetches and validates BCMR JSON files
+4. Exports IPFS CIDs from registry metadata
+5. Exports IPFS CIDs from JSON file contents
+6. Pins all CIDs to local IPFS daemon (automatically skips already-pinned CIDs using cache)
+
+### Update Existing Data
+
+Use same command to update the existing data. Tool uses caching to improve execution speed and reduce number of queries and fetches:
+
+```bash
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+```
+
+Cached components:
+- Authchains (only queries new/changed chains)
+- Json file fetches (doesn't download already stored json file)
+- Json validation (caches invalid JSON hashes, so it doesn't ever retry to download invalid json)
+- IPFS pins (skips already-pinned CIDs)
+
+### Iterative Development Workflow
+
+After the initial Chaingraph query, you can re-run authchain resolution without re-querying:
+
+```bash
+# First time: Query Chaingraph
+bch-ipfs-scrape --query-chaingraph
+
+# Subsequent runs: Just resolve authchains (much faster)
+bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+```
+
+This is useful for testing or when you want to modify the Chaingraph results before processing.
+
+### Export and Pin CIDs
+
+Export and pin from both sources (pins both files by default):
+
+```bash
+bch-ipfs-scrape --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+```
+
+Pin from a single file:
+
+```bash
+bch-ipfs-scrape --ipfs-pin --ipfs-pin-file bcmr-ipfs-cids.txt
+```
+
+### Custom Output Files
+
+```bash
+bch-ipfs-scrape --query-chaingraph --authchain-resolve \
+  --export IPFS,HTTPS --export-file all-urls.txt \
+  --export-bcmr-ipfs-cids --cids-file my-cids.txt
+```
+
+## Using Without Chaingraph Access
+
+If you don't have access to a Chaingraph endpoint, you can download a pre-generated Chaingraph result file.
+
+### Download Pre-generated Chaingraph Results
+
+1. **Download the latest Chaingraph results:**
+
+```bash
+# Download to your working directory
+wget https://ipfs.9500.cash/chaingraph-result.json
+
+# Or use curl
+curl -o chaingraph-result.json https://ipfs.9500.cash/chaingraph-result.json
+```
+
+2. **Run authchain resolution with the downloaded file:**
+
+```bash
+# CHAINGRAPH_URL is NOT required when using a pre-saved file
+# Only FULCRUM_WS_URL is needed in your .env file
+bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+```
+
+**Note:** When using a pre-saved `chaingraph-result.json` file:
+- The `CHAINGRAPH_URL` environment variable is **not required**
+- Only `FULCRUM_WS_URL` is needed for authchain resolution
+- You can skip the `--query-chaingraph` command entirely
+- The tool will automatically load data from the existing `chaingraph-result.json` file
+
+### Custom File Location
+
+If you want to save the result to a different location:
+
+```bash
+# Download to custom location
+wget -O ./my-data/chaingraph.json https://ipfs.9500.cash/chaingraph-result.json
+
+# Then specify it when running authchain resolution:
+bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./my-data/chaingraph.json
 ```
 
 ## Features
@@ -205,113 +312,6 @@ Bash script alternative for sequential pinning:
 ./pin-cids.sh bcmr-ipfs-cids.txt 10       # 10s timeout
 ```
 
-## Common Workflows
-
-### Complete Workflow (Recommended)
-
-Query Chaingraph, resolve authchains, fetch JSON, export CIDs, and pin everything to IPFS:
-
-```bash
-bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
-```
-
-This command:
-1. Queries Chaingraph and saves raw results
-2. Resolves authchains from Chaingraph data
-3. Fetches and validates BCMR JSON files
-4. Exports IPFS CIDs from registry metadata
-5. Exports IPFS CIDs from JSON file contents
-6. Pins all CIDs to local IPFS daemon (automatically skips already-pinned CIDs using cache)
-
-### Update Existing Data
-
-Use caching to quickly update (subsequent runs are much faster):
-
-```bash
-bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
-```
-
-Cached components:
-- Authchains (only queries new/changed chains)
-- IPFS pins (skips already-pinned CIDs)
-
-### Iterative Development Workflow
-
-After the initial Chaingraph query, you can re-run authchain resolution without re-querying:
-
-```bash
-# First time: Query Chaingraph
-bch-ipfs-scrape --query-chaingraph
-
-# Subsequent runs: Just resolve authchains (much faster)
-bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
-```
-
-This is useful for testing or when you want to modify the Chaingraph results before processing.
-
-### Export and Pin CIDs
-
-Export and pin from both sources (pins both files by default):
-
-```bash
-bch-ipfs-scrape --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
-```
-
-Pin from a single file:
-
-```bash
-bch-ipfs-scrape --ipfs-pin --ipfs-pin-file bcmr-ipfs-cids.txt
-```
-
-### Custom Output Files
-
-```bash
-bch-ipfs-scrape --query-chaingraph --authchain-resolve \
-  --export IPFS,HTTPS --export-file all-urls.txt \
-  --export-bcmr-ipfs-cids --cids-file my-cids.txt
-```
-
-## Using Without Chaingraph Access
-
-If you don't have access to a Chaingraph endpoint, you can download a pre-generated Chaingraph result file.
-
-### Download Pre-generated Chaingraph Results
-
-1. **Download the latest Chaingraph results:**
-
-```bash
-# Download to your working directory
-wget https://ipfs.9500.cash/chaingraph-result.json
-
-# Or use curl
-curl -o chaingraph-result.json https://ipfs.9500.cash/chaingraph-result.json
-```
-
-2. **Run authchain resolution with the downloaded file:**
-
-```bash
-# CHAINGRAPH_URL is NOT required when using a pre-saved file
-# Only FULCRUM_WS_URL is needed in your .env file
-bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
-```
-
-**Note:** When using a pre-saved `chaingraph-result.json` file:
-- The `CHAINGRAPH_URL` environment variable is **not required**
-- Only `FULCRUM_WS_URL` is needed for authchain resolution
-- You can skip the `--query-chaingraph` command entirely
-- The tool will automatically load data from the existing `chaingraph-result.json` file
-
-### Custom File Location
-
-If you want to save the result to a different location:
-
-```bash
-# Download to custom location
-wget -O ./my-data/chaingraph.json https://ipfs.9500.cash/chaingraph-result.json
-
-# Then specify it when running authchain resolution:
-bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./my-data/chaingraph.json
-```
 
 ## Working Directory
 
@@ -331,7 +331,7 @@ When `BCMR_WORKDIR` is set:
 - Useful for organizing data or running multiple instances with different datasets
 
 When `BCMR_WORKDIR` is not set:
-- Files are saved in the current working directory (original behavior)
+- Files are saved in the current working directory
 - Maintains backward compatibility with existing setups
 
 ## Output Files
@@ -351,9 +351,9 @@ When `BCMR_WORKDIR` is not set:
 
 **For pre-built binary:**
 - Linux (x64 or ARM64)
-- Access to a Chaingraph server (GraphQL endpoint)
-- Access to a Fulcrum server (Electrum WebSocket endpoint)
-- IPFS daemon (optional, for `--ipfs-pin` command)
+- Access to a GraphQL endpoint of a Chaingraph server (optional, required only for the --query-chaingraph command. Can be omitted to run other commands from the saved query result)
+- Access to a Electrum WebSocket endpoint of a Fulcrum server (optional, required only for the --authchain-resolve command. Can be omitted to run other commands from the resolved authhead.json)
+- IPFS daemon (optional, required only for the `--ipfs-pin` command)
 
 **For building from source:**
 - Node.js 20+
