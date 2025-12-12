@@ -5,14 +5,12 @@ This document provides detailed technical information about the BCMR Registry To
 ## Table of Contents
 
 - [Project Structure](#project-structure)
-- [Two-Step Workflow](#two-step-workflow)
-- [Authchain Caching](#authchain-caching)
-- [IPFS Pin Caching](#ipfs-pin-caching)
+- [Working with Chaingraph Data](#working-with-chaingraph-data)
+- [Caching](#caching)
 - [IPFS Gateway Rewriting](#ipfs-gateway-rewriting)
 - [Command Reference](#command-reference)
 - [Output Formats](#output-formats)
 - [Filtering Rules](#filtering-rules)
-- [Cache Behavior](#cache-behavior)
 - [Development](#development)
 
 ## Project Structure
@@ -28,6 +26,7 @@ This document provides detailed technical information about the BCMR Registry To
 ├── bcmr-registries/
 │   ├── .authchain-cache.json     # Authchain resolution cache (auto-generated)
 │   ├── .ipfs-pin-cache.json      # IPFS pin cache (auto-generated)
+│   ├── .validation-cache.json    # Validation cache (auto-generated)
 │   └── *.json                    # Registry JSON files (with --fetch-json)
 ├── chaingraph-result.json        # Raw Chaingraph query results (with --query-chaingraph)
 ├── authhead.json                 # Current registries: active + burned (with --authchain-resolve)
@@ -40,67 +39,115 @@ This document provides detailed technical information about the BCMR Registry To
 └── tsconfig.json                 # TypeScript configuration
 ```
 
-## Two-Step Workflow
+## Working with Chaingraph Data
 
-Starting with version 1.0.0, the tool separates Chaingraph querying from authchain resolution into two distinct steps:
+The tool provides flexible options for working with Chaingraph data, allowing you to customize queries, inspect results, or reuse existing data.
 
-### Step 1: Query Chaingraph (`--query-chaingraph`)
+### Querying Chaingraph (`--query-chaingraph`)
 
-Queries Chaingraph and saves raw results to a file (default: `chaingraph-result.json`).
+Fetches BCMR registry data from Chaingraph and saves it locally.
 
-**Benefits:**
-- **Custom queries** - Provide your own GraphQL query file to influence input data
-- **Inspection** - Review Chaingraph results before processing
-- **Iteration** - Re-run authchain resolution without re-querying Chaingraph
-- **Reduced load** - Avoid redundant Chaingraph queries during development
-
-**Usage:**
+**Basic usage:**
 ```bash
-# Default BCMR query
-bch-ipfs-scrape --query-chaingraph
+# Use default BCMR query
+bch-ipfs-scrape --query-chaingraph --authchain-resolve
+```
 
-# Custom GraphQL query
-bch-ipfs-scrape --query-chaingraph my-custom-query.graphql
+**Advanced options:**
 
-# Custom output file location
+**Custom GraphQL queries:**
+```bash
+# Provide your own GraphQL query file
+bch-ipfs-scrape --query-chaingraph my-custom-query.graphql --authchain-resolve
+```
+
+**Custom storage location:**
+```bash
+# Save results to specific location
 bch-ipfs-scrape --query-chaingraph --chaingraph-result-file ./data/results.json
 ```
 
-### Step 2: Resolve Authchains (`--authchain-resolve`)
+**Why use custom queries?**
+- Filter specific registries or token categories
+- Adjust query parameters for different block ranges
+- Experiment with alternative data sources
 
-Loads Chaingraph data from the result file and resolves authchains to determine current registry states.
+### Reusing Chaingraph Results
+
+Chaingraph results are saved to disk (default: `chaingraph-result.json`). You can reprocess the same data without re-querying Chaingraph:
+
+```bash
+# Initial query
+bch-ipfs-scrape --query-chaingraph --authchain-resolve
+
+# Later: reprocess the same data with different options
+bch-ipfs-scrape --authchain-resolve --fetch-json
+bch-ipfs-scrape --authchain-resolve --no-cache --verbose
+```
+
+**Benefits:**
+- **Faster iteration** - Skip network queries during testing or development
+- **Inspect data** - Review `chaingraph-result.json` before processing
+- **Reduced load** - Avoid redundant Chaingraph queries
+- **Offline processing** - Work with cached data without Chaingraph access
 
 **Requirements:**
-- Must run `--query-chaingraph` first (or have an existing `chaingraph-result.json`)
-- Requires `FULCRUM_WS_URL` in `.env` (does not need `CHAINGRAPH_URL`)
+- Authchain resolution requires `FULCRUM_WS_URL` in `.env`
+- Querying Chaingraph requires `CHAINGRAPH_URL` in `.env`
+- Reusing results only requires `FULCRUM_WS_URL`
 
-**Usage:**
+### Complete Workflow Examples
+
+**Standard workflow (query + process):**
 ```bash
-# Basic usage (uses ./chaingraph-result.json)
-bch-ipfs-scrape --authchain-resolve
-
-# Custom result file location
-bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./data/results.json
+bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --ipfs-pin
 ```
 
-### Combined Workflow
-
-You can combine both commands in a single invocation:
-
+**Separate query and processing:**
 ```bash
-# Query and resolve in one command
-bch-ipfs-scrape --query-chaingraph --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --ipfs-pin
+# First: query and inspect
+bch-ipfs-scrape --query-chaingraph
+cat chaingraph-result.json | jq '.data | length'
+
+# Later: process with specific options
+bch-ipfs-scrape --authchain-resolve --fetch-valid-json --export-bcmr-ipfs-cids
 ```
 
-## Authchain Caching
+**Custom query with custom storage:**
+```bash
+bch-ipfs-scrape \
+  --query-chaingraph custom-query.graphql \
+  --chaingraph-result-file ./data/my-registries.json \
+  --authchain-resolve \
+  --fetch-json
+```
 
-### How It Works
+## Caching
 
-The tool automatically caches authchain resolution results to avoid redundant blockchain queries on subsequent runs.
+### Overview
 
-**Cache Location:** `bcmr-registries/.authchain-cache.json`
+The tool implements multiple caching layers to avoid redundant operations:
 
-**Cache Types:**
+| Cache Type | What It Stores | Storage Location | Scope |
+|------------|----------------|------------------|-------|
+| Authchain Cache | Authchain resolution results | `.authchain-cache.json` | Persistent |
+| IPFS Pin Cache | Successfully pinned CIDs | `.ipfs-pin-cache.json` | Persistent |
+| Validation Cache | Invalid JSON files | `.validation-cache.json` | Persistent |
+| JSON File Cache | Downloaded registry files | `{tokenId}.json` files | Persistent |
+
+All persistent caches are stored in the output directory (default: `./bcmr-registries/`).
+
+Use `--no-cache` to bypass caching behavior.
+
+### Authchain Cache
+
+**Purpose:** Avoids redundant blockchain queries by caching authchain resolution results.
+
+**Storage Location:** `bcmr-registries/.authchain-cache.json`
+
+**How It Works:**
+
+The cache stores the result of walking each authchain (following the chain of OP_RETURN outputs from authbase to authhead). On subsequent runs:
 
 1. **Perfect hits** - Inactive chains (authhead spent, chain ended)
    - Never need revalidation
@@ -117,26 +164,21 @@ The tool automatically caches authchain resolution results to avoid redundant bl
 4. **Misses** - New registries not in cache
    - Full authchain walk required
 
-### Cache Management
+**What Gets Cached:**
 
-**Enable/Disable:**
-```bash
-# Use cache (default, requires --query-chaingraph first)
-bch-ipfs-scrape --query-chaingraph --authchain-resolve
-
-# Disable cache (force full resolution)
-bch-ipfs-scrape --query-chaingraph --authchain-resolve --no-cache
-
-# Clear cache and start fresh
-bch-ipfs-scrape --query-chaingraph --authchain-resolve --clear-cache
-```
+Each cache entry stores:
+- Authbase transaction ID
+- Current authhead transaction ID
+- Chain length (number of hops)
+- Active status (whether authhead output is unspent)
+- Last checked timestamp
 
 **Cache Updates:**
 - Cache is saved only on successful completion
 - Interrupted runs do not corrupt the cache
 - Atomic write ensures data integrity
 
-### Cache Statistics
+**Verbose Output:**
 
 Run with `--verbose` to see detailed cache information:
 
@@ -162,43 +204,33 @@ Fulcrum Query Statistics:
   Average per registry: 0.51
 ```
 
-## IPFS Pin Caching
+### IPFS Pin Cache
 
-### How It Works
+**Purpose:** Avoids redundant IPFS pinning operations by tracking successfully pinned CIDs.
 
-The tool automatically caches successfully pinned CIDs to avoid redundant pinning operations on subsequent runs.
+**Storage Location:** `bcmr-registries/.ipfs-pin-cache.json`
 
-**Cache Location:** `bcmr-registries/.ipfs-pin-cache.json`
+**How It Works:**
 
-**Benefits:**
-- **Skip already-pinned CIDs** - Dramatically speeds up subsequent pin operations
-- **Automatic cache management** - No manual intervention required
-- **Persistent across runs** - Cache survives restarts and updates
-
-### Cache Behavior
-
-**On Each Run:**
+On each run with `--ipfs-pin`:
 1. Loads existing cache (if present)
 2. Filters out already-cached CIDs before processing
 3. Pins only new CIDs
 4. Updates cache with newly pinned CIDs
 5. Saves merged cache to disk
 
-**Cache Updates:**
-- Only successfully pinned CIDs are cached
-- Failed pins are NOT cached (will retry on next run)
-- Cache is saved after all files are processed
-- Atomic write ensures data integrity
+**What Gets Cached:**
 
-### Cache File Format
+Only successfully pinned CIDs are cached. Failed pins are NOT cached and will retry on the next run.
+
+**Cache Structure:**
 
 JSON file containing:
 ```json
 {
   "pinnedCids": [
     "QmVwdDCY4SPGVFnNCiZnX5CtzwWDn6kAM98JXzKxE3kCmn",
-    "bafyreihwqw6lsve7gkorqemerjrl3t5fjxpjdljbndto467zixmstw43aq",
-    ...
+    "bafyreihwqw6lsve7gkorqemerjrl3t5fjxpjdljbndto467zixmstw43aq"
   ],
   "lastUpdated": "2025-01-15T12:34:56.789Z",
   "totalCount": 1234
@@ -210,21 +242,61 @@ JSON file containing:
 - `lastUpdated` - ISO 8601 timestamp of last cache update
 - `totalCount` - Total number of cached CIDs
 
-### Manual Cache Management
+**Cache Updates:**
+- Cache is saved after all files are processed
+- Atomic write ensures data integrity
 
-The pin cache is managed automatically, but you can manually manage it if needed:
+### Validation Cache
 
-**View cache:**
-```bash
-cat bcmr-registries/.ipfs-pin-cache.json | jq '.totalCount'
-```
+**Purpose:** Prevents re-downloading and re-validating files known to be schema-invalid.
 
-**Clear cache:**
-```bash
-rm bcmr-registries/.ipfs-pin-cache.json
-```
+**Storage Location:** `bcmr-registries/.validation-cache.json`
 
-**Note:** Unlike authchain cache, there's no `--clear-pin-cache` flag. Simply delete the file to rebuild the cache from scratch.
+**How It Works:**
+
+Active only when using `--fetch-valid-json` (not plain `--fetch-json`):
+- Before downloading: checks if the hash is cached as invalid → skips download
+- After validation fails: caches the actual content hash with error details
+- Uses SHA-256 of actual file content (not claimed hash) to prevent cache poisoning
+
+**What Gets Cached:**
+
+Only files that fail BCMR v2 schema validation. Valid files are not cached here (they're saved as JSON files, see below).
+
+**Cache Structure:**
+
+Stored in `.validation-cache.json` with entries containing:
+- SHA-256 hash of content
+- Source URL
+- Validation errors
+- Last checked timestamp
+- Attempt count
+
+**Important Design Detail:**
+
+The cache uses the actual content hash (computed after download), not the claimed hash from the blockchain OP_RETURN. This prevents cache poisoning if blockchain data contains incorrect hashes.
+
+### JSON File Cache
+
+**Purpose:** Reuses previously downloaded BCMR registry files without re-fetching from the network.
+
+**Storage Location:** Individual files in `bcmr-registries/{tokenId}.json`
+
+**How It Works:**
+
+Automatic for all `--fetch-json` and `--fetch-valid-json` operations:
+- Before network fetch: checks if `{tokenId}.json` exists locally
+- If exists: computes SHA-256 hash and compares to OP_RETURN hash
+- Hash match → uses local file (skip network)
+- Hash mismatch → fetches from network (file outdated/corrupted)
+
+**What Gets Cached:**
+
+Complete BCMR registry JSON files, stored with exact formatting to preserve hash integrity. Named by tokenId (transaction hash).
+
+**Cache Verification:**
+
+Hash-based verification ensures cached files are current and uncorrupted. The `--ignore-json-hash` flag allows storing files even when hash verification fails.
 
 ## IPFS Gateway Rewriting
 
@@ -698,44 +770,6 @@ Protocol filters (`--export`) determine which URIs are exported:
 - `OTHER` - Matches any other protocol
 - `ALL` - No filtering, exports all URIs
 
-## Cache Behavior
-
-### When Cache Is Used
-
-- **--authchain-resolve** - Always attempts to use cache unless `--no-cache` specified
-- Cache location: `bcmr-registries/.authchain-cache.json`
-- Created automatically on first run
-
-### Cache Invalidation
-
-Cache entries are revalidated when:
-- Active chains: Checked if authhead is still unspent
-- Spent authheads: Chain is extended from cached position
-- Never revalidated: Inactive chains (authhead already spent)
-
-### Cache Safety
-
-- **Atomic writes** - Cache saved in single operation
-- **Interruption safe** - Incomplete runs don't corrupt cache
-- **Manual clearing** - Use `--clear-cache` to delete
-- **Disable temporarily** - Use `--no-cache` to bypass
-
-### Cache File Format
-
-JSON file containing:
-```json
-{
-  "tokenId": {
-    "tokenId": "string",
-    "authbase": "string",
-    "authhead": "string",
-    "authchainLength": number,
-    "isActive": boolean,
-    "timestamp": "ISO 8601 string"
-  }
-}
-```
-
 ## Development
 
 ### Build Standalone Binary
@@ -782,7 +816,76 @@ npm run build
 
 ### Testing
 
-The tool can be tested with different data sources:
+The project includes automated tests using Vitest v4.
+
+#### Running Tests
+
+**Prerequisites:**
+```bash
+# Build the TypeScript source first
+npm run build
+```
+
+**Available test commands:**
+```bash
+# Run all tests once
+npm test
+
+# Run tests in watch mode (auto-rerun on changes)
+npm run test:watch
+
+# Run tests with interactive web UI
+npm run test:ui
+
+# Run tests with coverage report
+npm run test:coverage
+```
+
+**Run specific tests:**
+```bash
+# Run specific test file
+npx vitest run tests/unit/gateway-rewrite.test.ts
+
+# Run tests matching a pattern
+npx vitest run --grep "cache"
+```
+
+#### Environment Requirements
+
+Integration tests require environment variables in `.env`:
+
+**FULCRUM_WS_URL** (required for authchain resolution tests):
+```bash
+FULCRUM_WS_URL=ws://your-fulcrum-server:50003
+```
+
+**CHAINGRAPH_URL** (required for Chaingraph query tests):
+```bash
+CHAINGRAPH_URL=http://your-chaingraph-server:8088/v1/graphql
+```
+
+Tests gracefully skip when environment variables are missing.
+
+#### Test Coverage
+
+The test suite includes:
+
+**Integration tests** (`tests/integration/`):
+- CLI version display
+- Chaingraph querying with custom GraphQL
+- Authchain resolution via Fulcrum
+- Cache creation, updates, and invalidation
+- Cache flags (`--clear-cache`, `--no-cache`)
+
+**Unit tests** (`tests/unit/`):
+- Gateway URL rewriting and normalization
+- IPFS URI conversion (ipfs:// → https://)
+- Gateway mapping file validation
+- Private IP support for local gateways
+
+#### Manual Testing
+
+The tool can also be tested manually with different configurations:
 
 ```bash
 # Test with custom Chaingraph endpoint
