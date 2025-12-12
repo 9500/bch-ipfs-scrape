@@ -28,7 +28,7 @@ BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain
    cp .env.example .env
    ```
 
-3. **Edit `.env` with your endpoints:**
+3. **Edit `.env` with your endpoints (Check Using Without Chaingraph or Fulcrum Access chapter if any endpoint is not available)**
    ```
    CHAINGRAPH_URL=http://your-chaingraph-server:8088/v1/graphql
    FULCRUM_WS_URL=ws://your-fulcrum-server:50003
@@ -60,7 +60,15 @@ BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain
    # Edit .env with your endpoints
    ```
 
-4. **Build standalone binary:**
+4. **Edit `.env` with your endpoints (See chapter Using Without Chaingraph or Fulcrum Access if any endpoint is not available)**
+   ```
+   CHAINGRAPH_URL=http://your-chaingraph-server:8088/v1/graphql
+   FULCRUM_WS_URL=ws://your-fulcrum-server:50003
+   # Optional: Set a working directory for all output files
+   # BCMR_WORKDIR=/path/to/data
+   ```
+
+5. **Build standalone binary:**
    ```bash
    # Build binary for both x64 and arm64
    npm run pkg
