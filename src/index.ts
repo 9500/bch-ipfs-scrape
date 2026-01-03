@@ -13,15 +13,23 @@ import { createHash } from 'crypto';
 import { execSync, spawn } from 'child_process';
 import { CID } from 'multiformats/cid';
 
-// Get package version (works in both ESM and bundled CommonJS)
-let VERSION = '1.0.3'; // Fallback version
-try {
-  // Try to read from package.json (works when running from source)
-  const packageJsonPath = new URL('../package.json', import.meta.url);
-  const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
-  VERSION = packageJson.version;
-} catch (e) {
-  // Fallback for bundled version - version is hardcoded above
+// Declare for esbuild injection (will be replaced at bundle time)
+declare const PACKAGE_VERSION: string | undefined;
+
+// Get package version
+let VERSION: string;
+if (typeof PACKAGE_VERSION !== 'undefined') {
+  // Bundled version - injected by esbuild at build time
+  VERSION = PACKAGE_VERSION;
+} else {
+  // Development - read from package.json
+  try {
+    const packageJsonPath = new URL('../package.json', import.meta.url);
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
+    VERSION = packageJson.version;
+  } catch (e) {
+    VERSION = 'unknown';
+  }
 }
 
 // Load environment variables

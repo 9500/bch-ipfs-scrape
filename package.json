@@ -7,7 +7,7 @@
   "license": "MIT",
   "scripts": {
     "build": "tsc",
-    "bundle": "npm run build && esbuild dist/index.js --bundle --platform=node --format=cjs --outfile=dist/bundled.cjs",
+    "bundle": "npm run build && esbuild dist/index.js --bundle --platform=node --format=cjs --define:PACKAGE_VERSION='\"'$(node -p \"require('./package.json').version\")'\"' --outfile=dist/bundled.cjs",
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
     "pkg": "npm run bundle && pkg dist/bundled.cjs --compress GZip",
