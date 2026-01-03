@@ -485,6 +485,30 @@ After blockchain URLs pass initial validation, gateway rewriting can redirect to
 
 This design allows using private gateways while protecting against SSRF attacks.
 
+#### Trust Model
+
+The security model distinguishes between two input sources:
+
+**User input (TRUSTED):**
+- Command-line arguments (`--ipfs-gateway`, `--target-gateway`, `--gateway-mapping`)
+- Environment variables (`BCMR_WORKDIR`, `CHAINGRAPH_URL`, etc.)
+- CID files that users can manually edit
+- Gateway mapping JSON files
+
+Users have local access and can configure the tool however they want, including rewriting to private gateways or modifying CID lists.
+
+**Blockchain input (UNTRUSTED):**
+- URLs from OP_RETURN data in BCMR transactions
+- Hashes and metadata embedded in blockchain
+
+This data is validated before use:
+- Internal/private hostnames are blocked (localhost, 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 169.254.x.x)
+- IPv6-mapped IPv4 addresses are detected and blocked (e.g., `::ffff:192.168.1.1`)
+- Non-standard ports are rejected (only ports 80/443 or no port allowed)
+- Private IPv6 ranges are blocked (fc00::/7, fd00::/8, fe80::/10)
+
+Gateway rewriting happens AFTER blockchain validation, so user-configured rewrites to private IPs are allowed while direct blockchain access to internal services is blocked.
+
 ### Complete Usage Examples
 
 #### Use Local IPFS Gateway

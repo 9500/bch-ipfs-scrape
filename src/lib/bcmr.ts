@@ -751,6 +751,18 @@ function isInternalHostname(hostname: string): boolean {
     return true;
   }
 
+  // IPv6-mapped IPv4 addresses (::ffff:x.x.x.x)
+  // These represent IPv4 addresses in IPv6 format and must be checked
+  // against private IPv4 ranges to prevent SSRF bypass
+  const ipv6MappedMatch = hostname.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
+  if (ipv6MappedMatch) {
+    const ipv4Part = ipv6MappedMatch[1];
+    // Check the embedded IPv4 against private ranges
+    if (/^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.)/.test(ipv4Part)) {
+      return true;
+    }
+  }
+
   return false;
 }
 
@@ -896,11 +908,18 @@ function rewriteGatewayUrl(url: string, config: GatewayConfig): string {
  * - ipfs:// URIs are converted to IPFS gateway URLs (configurable gateway)
  * - URIs without protocol are assumed to be HTTPS per BCMR spec
  * - http:// and https:// URIs are validated for security and optionally rewritten
- * SECURITY: Blocks internal/private addresses for blockchain-sourced URLs (before rewriting)
- * User-configured gateways are trusted and bypass SSRF checks
  *
- * @param uri - URI to normalize
- * @param config - Optional gateway configuration for rewriting
+ * SECURITY - Trust Model:
+ * - Blockchain input (URIs): UNTRUSTED - validated for SSRF protection
+ *   - Internal/private hostnames blocked (localhost, 10.x, 172.16-31.x, 192.168.x, etc.)
+ *   - IPv6-mapped IPv4 addresses blocked (::ffff:192.168.x.x)
+ *   - Non-standard ports blocked (only 80/443 allowed)
+ * - User input (gateway config): TRUSTED - can specify private IPs
+ *   - Gateway rewriting happens AFTER blockchain validation
+ *   - Users explicitly choose to redirect to private gateways
+ *
+ * @param uri - URI to normalize (from blockchain, untrusted)
+ * @param config - Optional gateway configuration for rewriting (user-configured, trusted)
  * @returns Normalized and optionally rewritten URL
  */
 export function normalizeUri(uri: string, config?: GatewayConfig): string {
@@ -952,6 +971,12 @@ export function normalizeUri(uri: string, config?: GatewayConfig): string {
     // SECURITY: Block internal/private hostnames
     if (isInternalHostname(url.hostname)) {
       throw new Error(`Internal/private hostnames not allowed: ${url.hostname}`);
+    }
+
+    // SECURITY: Only allow standard HTTP(S) ports or no port specified
+    // This matches the validation in the explicit protocol branch above
+    if (url.port && !['', '80', '443'].includes(url.port)) {
+      throw new Error(`Non-standard ports not allowed: ${url.port}`);
     }
 
     // Apply gateway rewriting if this is an IPFS gateway URL
