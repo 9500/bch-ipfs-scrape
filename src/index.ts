@@ -76,29 +76,45 @@ interface AuthheadRegistry {
 }
 
 /**
- * Normalize gateway domain by removing protocols and trailing slashes
- * @param gateway - Gateway domain (may include https://, http://, or trailing /)
- * @returns Normalized gateway domain (e.g., "ipfs.io" or "192.168.1.100:8080")
+ * Normalize a user-configured gateway (a rewrite destination or the default
+ * ipfs:// gateway). An explicit `http://` is kept so plain-HTTP gateways such
+ * as a local Kubo daemon can be reached; `https://` is the default and is
+ * dropped. Trailing slashes are removed and the value is lowercased.
+ *
+ * @param gateway - Gateway (e.g. "ipfs.io", "https://ipfs.io/", "http://192.168.1.100:8080")
+ * @returns "host[:port]" for https gateways, "http://host[:port]" for http gateways
  */
 export function normalizeGatewayDomain(gateway: string): string {
   let normalized = gateway.trim();
 
-  // Strip https:// and http:// prefixes (case-insensitive)
-  normalized = normalized.replace(/^https?:\/\//i, '');
+  // https:// is the default scheme, so it carries no information
+  normalized = normalized.replace(/^https:\/\//i, '');
 
   // Strip trailing slashes
   normalized = normalized.replace(/\/+$/, '');
 
-  // Convert to lowercase for case-insensitive matching
+  // Convert to lowercase for case-insensitive matching (schemes and hosts are case-insensitive)
   normalized = normalized.toLowerCase();
 
   return normalized;
 }
 
 /**
+ * Normalize a gateway for matching against URLs found on the blockchain
+ * (a rewrite source). The scheme is irrelevant for matching, so both
+ * `http://` and `https://` are dropped.
+ *
+ * @returns "host[:port]", lowercased, without scheme or trailing slashes
+ */
+export function normalizeGatewayHost(gateway: string): string {
+  return normalizeGatewayDomain(gateway).replace(/^http:\/\//, '');
+}
+
+/**
  * Load gateway mapping from JSON file
  * Format: { "source-gateway.com": "dest-gateway.com" }
- * Automatically normalizes domains (strips https://, http://, trailing /)
+ * Sources are matched by host (any scheme is dropped); destinations keep an
+ * explicit http:// so plain-HTTP gateways can be targeted.
  * Supports private IPs and localhost in destinations (user-configured = trusted)
  * @param filepath - Path to JSON mapping file
  * @returns Map of source gateway -> destination gateway
@@ -132,7 +148,7 @@ export function loadGatewayMapping(filepath: string): Map<string, string> {
       throw new Error(`Gateway mapping values must be strings. Invalid value for "${source}": ${dest}`);
     }
 
-    const normalizedSource = normalizeGatewayDomain(source);
+    const normalizedSource = normalizeGatewayHost(source);
     const normalizedDest = normalizeGatewayDomain(dest);
 
     if (normalizedSource.length === 0) {
@@ -488,11 +504,14 @@ Options:
   --help, -h                    Show this help message
 
 Gateway Rewriting Options:
-  --ipfs-gateway <domain>       Set default gateway for ipfs:// URLs (default: ipfs.io)
-                                Supports private IPs (e.g., 192.168.1.100:8080)
+  --ipfs-gateway <gateway>      Set default gateway for ipfs:// URLs (default: ipfs.io)
+                                Supports private IPs and plain HTTP (e.g., http://192.168.1.100:8080)
+                                Without a scheme, https:// is used
   --rewrite-gateways            Enable rewriting all detected IPFS gateways
-  --target-gateway <domain>     Target gateway for global rewrite (required with --rewrite-gateways)
+  --target-gateway <gateway>    Target gateway for global rewrite (required with --rewrite-gateways)
+                                Same format as --ipfs-gateway
   --gateway-mapping <file>      JSON file with source→dest gateway mappings
+                                (destinations may use http://)
 
 Workflow Examples:
 
@@ -543,8 +562,8 @@ Workflow Examples:
   14. Use custom default gateway for ipfs:// URLs:
       bch-ipfs-scrape --fetch-json --ipfs-gateway dweb.link
 
-  15. Use private IPFS gateway:
-      bch-ipfs-scrape --fetch-json --ipfs-gateway 192.168.1.100:8080
+  15. Use a private IPFS gateway over plain HTTP (e.g. a local Kubo daemon):
+      bch-ipfs-scrape --fetch-json --ipfs-gateway http://192.168.1.100:8080
 
   16. Rewrite all gateways to a single target:
       bch-ipfs-scrape --fetch-json --rewrite-gateways --target-gateway gateway.pinata.cloud
@@ -554,7 +573,7 @@ Workflow Examples:
       # Example gateways.json format:
       # {
       #   "ipfs.io": "dweb.link",
-      #   "cloudflare-ipfs.com": "192.168.1.100:8080"
+      #   "cloudflare-ipfs.com": "http://192.168.1.100:8080"
       # }
 
 Protocol Filters:

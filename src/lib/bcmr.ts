@@ -75,10 +75,18 @@ export interface BCMRRegistry {
  * Gateway configuration for IPFS URL rewriting
  */
 export interface GatewayConfig {
-  defaultGateway: string;           // e.g., "ipfs.io" or "192.168.1.100:8080"
+  defaultGateway: string;           // "host[:port]" (https) or "http://host[:port]"
   rewriteAllGateways: boolean;      // Enable global rewrite
-  targetGateway: string | null;     // Target for global rewrite
-  gatewayMapping: Map<string, string> | null;  // source -> destination mapping
+  targetGateway: string | null;     // Target for global rewrite, same format as defaultGateway
+  gatewayMapping: Map<string, string> | null;  // source host -> destination gateway (same format)
+}
+
+/**
+ * Base URL of a user-configured gateway: an explicit http:// is honoured,
+ * anything else is reached over https.
+ */
+export function gatewayBaseUrl(gateway: string): string {
+  return /^http:\/\//i.test(gateway) ? gateway : `https://${gateway}`;
 }
 
 /**
@@ -1209,7 +1217,7 @@ function rewriteGatewayUrl(url: string, config: GatewayConfig): ResolvedUrl {
 
   // Reconstruct URL in path-style format (more compatible)
   return {
-    url: `https://${targetGateway}/ipfs/${detection.cid}${detection.pathAfterCid}`,
+    url: `${gatewayBaseUrl(targetGateway)}/ipfs/${detection.cid}${detection.pathAfterCid}`,
     userGateway: true,
   };
 }
@@ -1263,8 +1271,8 @@ export function resolveUri(uri: string, config?: GatewayConfig): ResolvedUrl {
 
   if (uri.startsWith('ipfs://')) {
     const hash = uri.replace('ipfs://', '');
-    // Use configurable gateway (may be private IP if user configured it)
-    return { url: `https://${gatewayConfig.defaultGateway}/ipfs/${hash}`, userGateway: true };
+    // Use configurable gateway (may be a private IP or plain http if user configured it)
+    return { url: `${gatewayBaseUrl(gatewayConfig.defaultGateway)}/ipfs/${hash}`, userGateway: true };
   }
 
   // If URI already has a protocol

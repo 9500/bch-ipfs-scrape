@@ -444,9 +444,15 @@ bch-ipfs-scrape --fetch-json --ipfs-gateway dweb.link
 
 **Default:** `ipfs.io`
 
-**Supports private IPs:**
+**Scheme:** a gateway given without a scheme is reached over `https://`. Prefix it with `http://` for a plain-HTTP gateway, such as a stock Kubo daemon on port 8080:
 ```bash
-bch-ipfs-scrape --fetch-json --ipfs-gateway 192.168.1.100:8080
+bch-ipfs-scrape --fetch-json --ipfs-gateway http://192.168.1.100:8080
+```
+- `ipfs://QmHash/file.json` → `http://192.168.1.100:8080/ipfs/QmHash/file.json`
+
+**Supports private IPs** (with or without `http://`):
+```bash
+bch-ipfs-scrape --fetch-json --ipfs-gateway 192.168.1.100:8080   # https://192.168.1.100:8080/ipfs/...
 ```
 
 #### 2. Global Gateway Rewriting
@@ -492,7 +498,8 @@ bch-ipfs-scrape --fetch-json --gateway-mapping gateways.json
 - `https://other-gateway.com/ipfs/QmHash` → No change (not in mapping)
 
 **Automatic normalization:**
-- Protocol prefixes stripped: `https://ipfs.io` → `ipfs.io`
+- Sources (keys) are matched by host, so any scheme is dropped: `https://ipfs.io` → `ipfs.io`, `http://ipfs.io` → `ipfs.io`
+- Destinations (values) drop `https://` (the default) but keep an explicit `http://`: `http://localhost:9000/` → `http://localhost:9000`
 - Trailing slashes removed: `ipfs.io/` → `ipfs.io`
 - Case-insensitive matching: `IPFS.IO` → `ipfs.io`
 - Port numbers preserved: `192.168.1.100:8080` stays as-is
@@ -513,7 +520,7 @@ When multiple rewriting options are configured, they are applied in this priorit
 **Example with multiple rules:**
 ```bash
 bch-ipfs-scrape --fetch-json \
-  --ipfs-gateway localhost:8080 \
+  --ipfs-gateway http://localhost:8080 \
   --rewrite-gateways \
   --target-gateway dweb.link \
   --gateway-mapping gateways.json
@@ -527,7 +534,7 @@ With `gateways.json`:
 ```
 
 **Results:**
-- `ipfs://QmHash` → `https://localhost:8080/ipfs/QmHash` (default gateway)
+- `ipfs://QmHash` → `http://localhost:8080/ipfs/QmHash` (default gateway)
 - `https://ipfs.io/ipfs/QmHash` → `https://gateway.pinata.cloud/ipfs/QmHash` (mapping wins)
 - `https://cloudflare-ipfs.com/ipfs/QmHash` → `https://dweb.link/ipfs/QmHash` (global rewrite)
 - `https://other.com/ipfs/QmHash` → `https://dweb.link/ipfs/QmHash` (global rewrite)
@@ -555,10 +562,10 @@ This ensures consistent URL formatting regardless of input format.
 
 #### User-Configured Gateways Are Trusted
 
-**Private IPs allowed** in gateway configuration:
-- `--ipfs-gateway 192.168.1.100:8080` ✅
-- `--target-gateway localhost:8080` ✅
-- `--gateway-mapping` with private IPs ✅
+**Private IPs and plain HTTP allowed** in gateway configuration:
+- `--ipfs-gateway http://192.168.1.100:8080` ✅
+- `--target-gateway http://localhost:8080` ✅
+- `--gateway-mapping` with private IPs and `http://` destinations ✅
 
 **Rationale:** User-configured gateways are an explicit choice, not untrusted blockchain data.
 
@@ -617,17 +624,18 @@ Gateway rewriting happens AFTER blockchain validation, so user-configured rewrit
 # Start local IPFS daemon
 ipfs daemon
 
-# Fetch using local gateway (much faster for pinned content)
-bch-ipfs-scrape --fetch-json --ipfs-gateway localhost:8080
+# Fetch using the local gateway (much faster for pinned content).
+# Kubo serves its gateway over plain HTTP, so give the scheme explicitly.
+bch-ipfs-scrape --fetch-json --ipfs-gateway http://localhost:8080
 ```
 
 #### Route All Traffic Through Private Gateway
 
 ```bash
-# Rewrite all IPFS gateway URLs to private infrastructure
+# Rewrite all IPFS gateway URLs to private infrastructure (plain HTTP)
 bch-ipfs-scrape --fetch-json \
   --rewrite-gateways \
-  --target-gateway 192.168.1.100:8080
+  --target-gateway http://192.168.1.100:8080
 ```
 
 #### Selective Gateway Routing
@@ -654,7 +662,7 @@ bch-ipfs-scrape --fetch-json --gateway-mapping gateways.json
 # - ipfs.io routes to Pinata
 # - All others route to dweb.link
 bch-ipfs-scrape --fetch-json \
-  --ipfs-gateway localhost:8080 \
+  --ipfs-gateway http://localhost:8080 \
   --rewrite-gateways \
   --target-gateway dweb.link \
   --gateway-mapping <(echo '{"ipfs.io":"gateway.pinata.cloud"}')
@@ -668,7 +676,7 @@ bch-ipfs-scrape \
   --query-chaingraph \
   --authchain-resolve \
   --fetch-json \
-  --ipfs-gateway localhost:8080 \
+  --ipfs-gateway http://localhost:8080 \
   --rewrite-gateways \
   --target-gateway dweb.link \
   --export-bcmr-ipfs-cids \
@@ -734,6 +742,7 @@ All entries above normalize to the same source (`ipfs.io`) → destination (`dwe
 - Verify mapping keys match detected gateway domains (case-insensitive)
 
 **Connection errors with private gateways:**
+- A gateway given without a scheme is contacted over `https://`; a stock Kubo gateway only speaks HTTP, so use `--ipfs-gateway http://192.168.1.100:8080`
 - Verify gateway is accessible: `curl http://192.168.1.100:8080/ipfs/QmTest`
 - Check firewall rules
 - Ensure gateway port is correct
@@ -774,9 +783,9 @@ All entries above normalize to the same source (`ipfs.io`) → destination (`dwe
 | `--concurrency, -c <num>` | Parallel query concurrency | `50` | 1-200 |
 | `--verbose, -v` | Enable verbose logging | false | Flag (no value) |
 | `--help, -h` | Show help message | - | Flag (no value) |
-| `--ipfs-gateway <domain>` | Default gateway for ipfs:// URLs | `ipfs.io` | Any domain or IP:port |
+| `--ipfs-gateway <gateway>` | Default gateway for ipfs:// URLs | `ipfs.io` | Domain or IP:port, optionally prefixed with `http://` (default scheme is https) |
 | `--rewrite-gateways` | Enable global gateway rewriting | false | Flag (requires `--target-gateway`) |
-| `--target-gateway <domain>` | Target gateway for global rewrite | - | Any domain or IP:port |
+| `--target-gateway <gateway>` | Target gateway for global rewrite | - | Same format as `--ipfs-gateway` |
 | `--gateway-mapping <file>` | JSON file with gateway mappings | - | Path to JSON file |
 
 ### Protocol Filters

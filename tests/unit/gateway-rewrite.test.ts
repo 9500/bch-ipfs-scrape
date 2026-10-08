@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from 'vitest';
-import { normalizeGatewayDomain, loadGatewayMapping } from '../../src/index.js';
+import { normalizeGatewayDomain, normalizeGatewayHost, loadGatewayMapping } from '../../src/index.js';
 import { normalizeUri, type GatewayConfig } from '../../src/lib/bcmr.js';
 import { writeFileSync, mkdirSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -32,8 +32,9 @@ describe('normalizeGatewayDomain', () => {
     expect(normalizeGatewayDomain('https://ipfs.io')).toBe('ipfs.io');
   });
 
-  test('removes http:// prefix', () => {
-    expect(normalizeGatewayDomain('http://ipfs.io')).toBe('ipfs.io');
+  test('keeps an explicit http:// prefix (plain-HTTP gateways)', () => {
+    expect(normalizeGatewayDomain('http://ipfs.io')).toBe('http://ipfs.io');
+    expect(normalizeGatewayDomain('HTTP://127.0.0.1:8080/')).toBe('http://127.0.0.1:8080');
   });
 
   test('removes trailing slashes', () => {
@@ -48,7 +49,7 @@ describe('normalizeGatewayDomain', () => {
 
   test('handles all transformations together', () => {
     expect(normalizeGatewayDomain('HTTPS://IPFS.IO/')).toBe('ipfs.io');
-    expect(normalizeGatewayDomain('HTTP://Gateway.Pinata.Cloud///')).toBe('gateway.pinata.cloud');
+    expect(normalizeGatewayDomain('HTTP://Gateway.Pinata.Cloud///')).toBe('http://gateway.pinata.cloud');
   });
 
   test('preserves port numbers', () => {
@@ -58,7 +59,13 @@ describe('normalizeGatewayDomain', () => {
 
   test('handles private IPs with ports', () => {
     expect(normalizeGatewayDomain('https://192.168.1.100:8080/')).toBe('192.168.1.100:8080');
-    expect(normalizeGatewayDomain('http://localhost:9000/')).toBe('localhost:9000');
+    expect(normalizeGatewayDomain('http://localhost:9000/')).toBe('http://localhost:9000');
+  });
+
+  test('normalizeGatewayHost drops any scheme (for matching blockchain URLs)', () => {
+    expect(normalizeGatewayHost('http://ipfs.io/')).toBe('ipfs.io');
+    expect(normalizeGatewayHost('https://IPFS.IO')).toBe('ipfs.io');
+    expect(normalizeGatewayHost('ipfs.io')).toBe('ipfs.io');
   });
 
   test('trims whitespace', () => {
@@ -100,12 +107,16 @@ describe('loadGatewayMapping', () => {
       JSON.stringify({
         'https://IPFS.IO/': 'dweb.link',
         'CLOUDFLARE-IPFS.COM': 'https://Gateway.Pinata.Cloud/',
+        'http://DWEB.LINK': 'HTTP://LocalHost:9000/',
       })
     );
 
     const mapping = loadGatewayMapping(mappingFile);
     expect(mapping.get('ipfs.io')).toBe('dweb.link');
     expect(mapping.get('cloudflare-ipfs.com')).toBe('gateway.pinata.cloud');
+    // Sources match by host regardless of scheme; destinations keep http://
+    expect(mapping.get('dweb.link')).toBe('http://localhost:9000');
+    expect(mapping.has('http://dweb.link')).toBe(false);
   });
 
   test('supports private IPs in destinations', () => {
@@ -225,6 +236,37 @@ describe('normalizeUri with gateway configuration', () => {
       };
       const result = normalizeUri(uri, config);
       expect(result).toBe('https://192.168.1.100:8080/ipfs/QmTest1234567890abcdefghijklmnop');
+    });
+
+    test('supports a plain-HTTP default gateway (--ipfs-gateway http://127.0.0.1:8080)', () => {
+      const config: GatewayConfig = {
+        defaultGateway: normalizeGatewayDomain('http://127.0.0.1:8080'),
+        rewriteAllGateways: false,
+        targetGateway: null,
+        gatewayMapping: null,
+      };
+      expect(normalizeUri('ipfs://QmTest1234567890abcdefghijklmnop', config)).toBe(
+        'http://127.0.0.1:8080/ipfs/QmTest1234567890abcdefghijklmnop'
+      );
+      expect(normalizeUri('ipfs://QmTest1234567890abcdefghijklmnop/path/file.json', config)).toBe(
+        'http://127.0.0.1:8080/ipfs/QmTest1234567890abcdefghijklmnop/path/file.json'
+      );
+    });
+
+    test('rewrites to a plain-HTTP target gateway and mapping destination', () => {
+      const config: GatewayConfig = {
+        defaultGateway: 'ipfs.io',
+        rewriteAllGateways: true,
+        targetGateway: normalizeGatewayDomain('http://192.168.1.100:8080'),
+        gatewayMapping: new Map([['dweb.link', normalizeGatewayDomain('http://localhost:9000')]]),
+      };
+      expect(normalizeUri('https://ipfs.io/ipfs/QmTest1234567890abcdefghijklmnop', config)).toBe(
+        'http://192.168.1.100:8080/ipfs/QmTest1234567890abcdefghijklmnop'
+      );
+      // Subdomain gateways carry lowercase base32 CIDv1 (hostnames are case-insensitive)
+      expect(normalizeUri('https://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.ipfs.dweb.link/a.json', config)).toBe(
+        'http://localhost:9000/ipfs/bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/a.json'
+      );
     });
   });
 

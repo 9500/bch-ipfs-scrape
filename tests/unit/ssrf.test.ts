@@ -1,15 +1,9 @@
 import { test, expect, describe, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
-import https from 'node:https';
-import { readFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { AddressInfo } from 'node:net';
 import { isInternalHostname, isPrivateIP, safeFetch } from '../../src/lib/ssrf.js';
 import { normalizeUri, resolveUri, fetchAndValidateRegistry, type GatewayConfig } from '../../src/lib/bcmr.js';
 import { createHash } from 'node:crypto';
-
-const tlsDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'tls');
 
 // ========================================
 // isInternalHostname() / isPrivateIP()
@@ -107,11 +101,8 @@ describe('safeFetch and fetchAndValidateRegistry', () => {
   const good = '{"identities":{}}';
   const bomGood = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(good)]);
   let server: http.Server;
-  let tlsServer: https.Server;
   let host: string;
-  let tlsHost: string;
   let config: GatewayConfig;
-  let previousTlsSetting: string | undefined;
 
   beforeAll(async () => {
     const handler = (req: http.IncomingMessage, res: http.ServerResponse) => {
@@ -129,25 +120,13 @@ describe('safeFetch and fetchAndValidateRegistry', () => {
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     host = `127.0.0.1:${(server.address() as AddressInfo).port}`;
 
-    // ipfs:// URIs always resolve to https://<gateway>, so the gateway used by
-    // fetchAndValidateRegistry must speak TLS (self-signed test certificate)
-    tlsServer = https.createServer(
-      { key: readFileSync(join(tlsDir, 'localhost.key')), cert: readFileSync(join(tlsDir, 'localhost.crt')) },
-      handler
-    );
-    await new Promise<void>((resolve) => tlsServer.listen(0, '127.0.0.1', resolve));
-    tlsHost = `127.0.0.1:${(tlsServer.address() as AddressInfo).port}`;
-    previousTlsSetting = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-
-    config = { defaultGateway: tlsHost, rewriteAllGateways: false, targetGateway: null, gatewayMapping: null };
+    // ipfs:// URIs resolve to the user's gateway; a plain-HTTP gateway is
+    // reached over http, so the test server needs no TLS
+    config = { defaultGateway: `http://${host}`, rewriteAllGateways: false, targetGateway: null, gatewayMapping: null };
   });
 
   afterAll(async () => {
-    if (previousTlsSetting === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
-    else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTlsSetting;
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await new Promise<void>((resolve) => tlsServer.close(() => resolve()));
   });
 
   test('refuses an internal host unless it is the trusted gateway', async () => {

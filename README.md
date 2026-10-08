@@ -260,7 +260,7 @@ bch-ipfs-scrape --authchain-resolve --chaingraph-result-file ./my-data/chaingrap
 - **IPFS Pinning** - Pin CIDs from both sources using local IPFS daemon
 - **Caching** - Automatically caches authchain resolution to speed up subsequent runs
 - **Parallel Processing** - Configurable concurrency for blockchain queries
-- **IPFS Gateway URL Rewriting** - Specify custom IPFS gateway to use (see [ADVANCED.md](ADVANCED.md))
+- **IPFS Gateway URL Rewriting** - Specify a custom IPFS gateway, including a plain-HTTP one such as a local Kubo daemon (`--ipfs-gateway http://localhost:8080`; see [ADVANCED.md](ADVANCED.md))
 
 ## Basic Commands
 
