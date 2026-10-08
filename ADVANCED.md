@@ -471,8 +471,11 @@ This ensures consistent URL formatting regardless of input format.
 #### Blockchain-Sourced URLs Are Validated
 
 **SSRF protection** for URLs from blockchain (before rewriting):
-- Internal/private IPs blocked: `http://localhost`, `http://192.168.1.1` ❌
+- Internal/private IPs blocked: `http://localhost`, `http://192.168.1.1`, `http://[::1]` ❌
 - Only standard ports allowed: `https://example.com:8080` ❌
+- Redirects are followed manually (max 5) and every hop is re-checked ❌ `302 → http://127.0.0.1/`
+- Hostnames are resolved before connecting; names pointing at private IPs are refused ❌
+- Response bodies are capped at `--max-file-size-mb` and the timeout covers the whole transfer
 
 **Rationale:** Blockchain data is untrusted and could contain malicious URLs targeting internal services.
 
@@ -501,13 +504,16 @@ Users have local access and can configure the tool however they want, including 
 - URLs from OP_RETURN data in BCMR transactions
 - Hashes and metadata embedded in blockchain
 
-This data is validated before use:
-- Internal/private hostnames are blocked (localhost, 10.x.x.x, 172.16-31.x.x, 192.168.x.x, 169.254.x.x)
-- IPv6-mapped IPv4 addresses are detected and blocked (e.g., `::ffff:192.168.1.1`)
+This data is validated before use (see `src/lib/ssrf.ts`):
+- `localhost` and `*.localhost` are blocked
+- Private/reserved IPv4 ranges are blocked: 0/8, 10/8, 100.64/10 (CGNAT), 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.168/16, 198.18/15, 224/4, 240/4. Shorthand forms (`127.1`, `2130706433`, `0x7f000001`) are canonicalized by the URL parser and caught too
+- Private/reserved IPv6 ranges are blocked: `::`, `::1`, fc00::/7, fe80::/10, fec0::/10, ff00::/8, plus IPv4 addresses embedded in IPv6 (`::ffff:a.b.c.d`, `::ffff:xxxx:xxxx`, NAT64 `64:ff9b::/96`)
 - Non-standard ports are rejected (only ports 80/443 or no port allowed)
-- Private IPv6 ranges are blocked (fc00::/7, fd00::/8, fe80::/10)
+- Every redirect hop is validated the same way; the chain is capped at 5 hops
+- The hostname is resolved via DNS before connecting and refused if any answer is a private address. A DNS-rebinding attacker who changes the answer between that lookup and the connection could still get through; treat this as defence in depth and run the tool on a host without sensitive services on its local network if that matters to you
+- Response bodies are capped at `--max-file-size-mb` (default 50 MB) and the per-attempt timeout covers the body, not just the headers
 
-Gateway rewriting happens AFTER blockchain validation, so user-configured rewrites to private IPs are allowed while direct blockchain access to internal services is blocked.
+Gateway rewriting happens AFTER blockchain validation, so user-configured rewrites to private IPs are allowed while direct blockchain access to internal services is blocked. Only the exact gateway host you configured is exempt from these checks; if your gateway redirects elsewhere, the redirect target is validated as untrusted.
 
 ### Complete Usage Examples
 

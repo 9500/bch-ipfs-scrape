@@ -13,6 +13,7 @@ import {
   getCacheStats,
 } from './authchain-cache.js';
 import { validateBCMRSchema } from './schema-validator.js';
+import { isInternalHostname, safeFetch } from './ssrf.js';
 
 // GraphQL query to fetch all BCMR outputs using prefix search
 const BCMR_QUERY = `
@@ -727,46 +728,6 @@ export async function getBCMRRegistries(options?: {
 }
 
 /**
- * Check if a hostname is an internal/private address
- * SECURITY: Prevents SSRF attacks targeting internal services
- */
-function isInternalHostname(hostname: string): boolean {
-  // Localhost patterns
-  if (/^(localhost|127\.|::1)$/i.test(hostname)) {
-    return true;
-  }
-
-  // Private IPv4 ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
-  if (/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/.test(hostname)) {
-    return true;
-  }
-
-  // Link-local addresses (169.254.0.0/16, fe80::/10)
-  if (/^(169\.254\.|fe80:)/i.test(hostname)) {
-    return true;
-  }
-
-  // Private IPv6 ranges (fc00::/7, fd00::/8)
-  if (/^(fc00:|fd00:)/i.test(hostname)) {
-    return true;
-  }
-
-  // IPv6-mapped IPv4 addresses (::ffff:x.x.x.x)
-  // These represent IPv4 addresses in IPv6 format and must be checked
-  // against private IPv4 ranges to prevent SSRF bypass
-  const ipv6MappedMatch = hostname.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
-  if (ipv6MappedMatch) {
-    const ipv4Part = ipv6MappedMatch[1];
-    // Check the embedded IPv4 against private ranges
-    if (/^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|169\.254\.)/.test(ipv4Part)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-/**
  * Result of IPFS gateway detection
  */
 interface IPFSGatewayDetection {
@@ -862,20 +823,29 @@ function detectIPFSGateway(url: string): IPFSGatewayDetection {
 }
 
 /**
+ * Result of resolving a blockchain URI to a fetchable URL
+ */
+export interface ResolvedUrl {
+  url: string;
+  /** True when the URL's host is a gateway the user configured (trusted) */
+  userGateway: boolean;
+}
+
+/**
  * Rewrite IPFS gateway URL based on configuration
  * Priority: gatewayMapping > global rewrite > no change
  *
  * @param url - Original URL
  * @param config - Gateway configuration
- * @returns Rewritten URL or original if no rewriting applies
+ * @returns Rewritten URL (flagged as user gateway) or original if no rewriting applies
  */
-function rewriteGatewayUrl(url: string, config: GatewayConfig): string {
+function rewriteGatewayUrl(url: string, config: GatewayConfig): ResolvedUrl {
   // Detect if this is an IPFS gateway URL
   const detection = detectIPFSGateway(url);
 
   if (!detection.isGateway || !detection.gateway || !detection.cid) {
     // Not a gateway URL, return unchanged
-    return url;
+    return { url, userGateway: false };
   }
 
   let targetGateway: string | null = null;
@@ -895,34 +865,55 @@ function rewriteGatewayUrl(url: string, config: GatewayConfig): string {
 
   // If no rewriting applies, return original URL
   if (!targetGateway) {
-    return url;
+    return { url, userGateway: false };
   }
 
   // Reconstruct URL in path-style format (more compatible)
-  const rewrittenUrl = `https://${targetGateway}/ipfs/${detection.cid}${detection.pathAfterCid}`;
-  return rewrittenUrl;
+  return {
+    url: `https://${targetGateway}/ipfs/${detection.cid}${detection.pathAfterCid}`,
+    userGateway: true,
+  };
 }
 
 /**
- * Normalize URI to a clickable HTTP(S) URL
+ * Validate a blockchain-sourced http(s) URL and apply gateway rewriting
+ * SECURITY: internal/private hosts and non-standard ports are rejected
+ * BEFORE rewriting; the rewrite target is user-configured and therefore trusted
+ */
+function validateAndRewrite(httpUrl: string, config: GatewayConfig): ResolvedUrl {
+  const url = new URL(httpUrl);
+
+  if (isInternalHostname(url.hostname)) {
+    throw new Error(`Internal/private hostnames not allowed: ${url.hostname}`);
+  }
+
+  if (url.port && !['', '80', '443'].includes(url.port)) {
+    throw new Error(`Non-standard ports not allowed: ${url.port}`);
+  }
+
+  return rewriteGatewayUrl(httpUrl, config);
+}
+
+/**
+ * Resolve a blockchain URI to a fetchable HTTP(S) URL
  * - ipfs:// URIs are converted to IPFS gateway URLs (configurable gateway)
  * - URIs without protocol are assumed to be HTTPS per BCMR spec
  * - http:// and https:// URIs are validated for security and optionally rewritten
  *
  * SECURITY - Trust Model:
  * - Blockchain input (URIs): UNTRUSTED - validated for SSRF protection
- *   - Internal/private hostnames blocked (localhost, 10.x, 172.16-31.x, 192.168.x, etc.)
- *   - IPv6-mapped IPv4 addresses blocked (::ffff:192.168.x.x)
+ *   - Internal/private hosts blocked (see ssrf.ts for the full list)
  *   - Non-standard ports blocked (only 80/443 allowed)
+ *   - Redirects and DNS answers are re-checked at fetch time (safeFetch)
  * - User input (gateway config): TRUSTED - can specify private IPs
  *   - Gateway rewriting happens AFTER blockchain validation
  *   - Users explicitly choose to redirect to private gateways
  *
- * @param uri - URI to normalize (from blockchain, untrusted)
+ * @param uri - URI to resolve (from blockchain, untrusted)
  * @param config - Optional gateway configuration for rewriting (user-configured, trusted)
- * @returns Normalized and optionally rewritten URL
+ * @returns Resolved URL and whether it targets a user-configured gateway
  */
-export function normalizeUri(uri: string, config?: GatewayConfig): string {
+export function resolveUri(uri: string, config?: GatewayConfig): ResolvedUrl {
   // Default configuration
   const gatewayConfig: GatewayConfig = config || {
     defaultGateway: 'ipfs.io',
@@ -934,56 +925,31 @@ export function normalizeUri(uri: string, config?: GatewayConfig): string {
   if (uri.startsWith('ipfs://')) {
     const hash = uri.replace('ipfs://', '');
     // Use configurable gateway (may be private IP if user configured it)
-    return `https://${gatewayConfig.defaultGateway}/ipfs/${hash}`;
+    return { url: `https://${gatewayConfig.defaultGateway}/ipfs/${hash}`, userGateway: true };
   }
 
   // If URI already has a protocol
   if (uri.startsWith('https://') || uri.startsWith('http://')) {
     try {
-      const url = new URL(uri);
-
-      // SECURITY: Block internal/private hostnames for blockchain-sourced URLs
-      // This check happens BEFORE gateway rewriting
-      // User-configured gateways (from config) are trusted and applied after this check
-      if (isInternalHostname(url.hostname)) {
-        throw new Error(`Internal/private hostnames not allowed: ${url.hostname}`);
-      }
-
-      // SECURITY: Only allow standard HTTP(S) ports or no port specified
-      // Exception: gateway rewriting may result in custom ports (which is fine, as it's user-configured)
-      if (url.port && !['', '80', '443'].includes(url.port)) {
-        throw new Error(`Non-standard ports not allowed: ${url.port}`);
-      }
-
-      // Apply gateway rewriting if configured
-      // This may rewrite to private IPs, which is allowed since it's user-configured
-      return rewriteGatewayUrl(uri, gatewayConfig);
+      return validateAndRewrite(uri, gatewayConfig);
     } catch (error) {
       throw new Error(`Invalid or unsafe URI: ${error instanceof Error ? error.message : error}`);
     }
   }
 
   // Per BCMR spec: URIs without protocol prefix assume HTTPS
-  const httpsUri = `https://${uri}`;
   try {
-    const url = new URL(httpsUri);
-
-    // SECURITY: Block internal/private hostnames
-    if (isInternalHostname(url.hostname)) {
-      throw new Error(`Internal/private hostnames not allowed: ${url.hostname}`);
-    }
-
-    // SECURITY: Only allow standard HTTP(S) ports or no port specified
-    // This matches the validation in the explicit protocol branch above
-    if (url.port && !['', '80', '443'].includes(url.port)) {
-      throw new Error(`Non-standard ports not allowed: ${url.port}`);
-    }
-
-    // Apply gateway rewriting if this is an IPFS gateway URL
-    return rewriteGatewayUrl(httpsUri, gatewayConfig);
+    return validateAndRewrite(`https://${uri}`, gatewayConfig);
   } catch (error) {
     throw new Error(`Invalid URI format: ${error instanceof Error ? error.message : error}`);
   }
+}
+
+/**
+ * Normalize URI to a clickable HTTP(S) URL (see resolveUri for the rules)
+ */
+export function normalizeUri(uri: string, config?: GatewayConfig): string {
+  return resolveUri(uri, config).url;
 }
 
 /**
@@ -997,7 +963,7 @@ export function ipfsToGateway(uri: string): string {
  * Result types for fetchAndValidateRegistry
  */
 export type FetchValidateResult =
-  | { success: true; json: any; rawContent: string; computedHash: string; hashVerified: boolean }
+  | { success: true; json: any; rawContent: string; rawBytes: Buffer; computedHash: string; hashVerified: boolean }
   | { success: false; schemaInvalid: true; computedHash: string; validationErrors: string[] }
   | { success: false; schemaInvalid: false };
 
@@ -1012,6 +978,8 @@ export type FetchValidateResult =
  * @param validateSchema - Enable JSON schema validation (default: false)
  * @param validationCacheEntry - Optional validation cache entry for this hash
  * @param ignoreJsonHash - Store files regardless of hash verification (default: false)
+ * @param config - Gateway configuration (user-configured, trusted)
+ * @param maxBytes - Maximum response body size in bytes (default: 50MB)
  * @returns Result object with success status, content, and validation details
  */
 export async function fetchAndValidateRegistry(
@@ -1022,7 +990,8 @@ export async function fetchAndValidateRegistry(
   validateSchema: boolean = false,
   validationCacheEntry?: { hash: string; url: string; isValid: boolean } | null,
   ignoreJsonHash: boolean = false,
-  config?: GatewayConfig
+  config?: GatewayConfig,
+  maxBytes: number = 50 * 1024 * 1024
 ): Promise<FetchValidateResult> {
   // Check validation cache before attempting download
   if (validateSchema && validationCacheEntry && !validationCacheEntry.isValid) {
@@ -1034,21 +1003,30 @@ export async function fetchAndValidateRegistry(
 
   for (const uri of uris) {
     // Convert IPFS URIs to gateway URLs (with optional gateway rewriting)
-    const fetchUrl = normalizeUri(uri, config);
+    // An unsafe URI only disqualifies itself, not the registry's other URIs
+    let resolved: ResolvedUrl;
+    try {
+      resolved = resolveUri(uri, config);
+    } catch (error) {
+      console.warn(`Skipping ${uri}: ${error instanceof Error ? error.message : error}`);
+      continue;
+    }
+    const fetchUrl = resolved.url;
     const urlDisplay = uri !== fetchUrl ? `${uri} → ${fetchUrl}` : uri;
+    // Only the user's own gateway host is exempt from SSRF checks at fetch time
+    const trustedHost = resolved.userGateway ? new URL(fetchUrl).host : null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      // The timeout covers the whole transfer (redirects + body), not just the headers
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
       try {
-        // Create abort controller for timeout
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-        // Fetch the JSON
-        const response = await fetch(fetchUrl, {
+        const response = await safeFetch(fetchUrl, {
           signal: controller.signal,
+          maxBytes,
+          trustedHost,
         });
-
-        clearTimeout(timeout);
 
         if (!response.ok) {
           console.warn(
@@ -1057,11 +1035,10 @@ export async function fetchAndValidateRegistry(
           continue;
         }
 
-        // Get raw text content
-        const rawContent = await response.text();
-
-        // Compute SHA-256 hash
-        const computedHash = createHash('sha256').update(rawContent).digest('hex');
+        // Hash the exact bytes served; decode separately (TextDecoder strips a BOM for JSON.parse)
+        const rawBytes = response.body;
+        const rawContent = new TextDecoder('utf-8').decode(rawBytes);
+        const computedHash = createHash('sha256').update(rawBytes).digest('hex');
 
         // Verify hash matches
         const hashVerified = computedHash === expectedHash;
@@ -1112,7 +1089,7 @@ export async function fetchAndValidateRegistry(
           }
 
           // Success! Return parsed JSON, raw content, computed hash, and hash verification status
-          return { success: true, json, rawContent, computedHash, hashVerified };
+          return { success: true, json, rawContent, rawBytes, computedHash, hashVerified };
         } catch (parseError) {
           console.warn(`JSON parse error from ${urlDisplay}:`, parseError);
           return { success: false, schemaInvalid: false };
@@ -1133,6 +1110,8 @@ export async function fetchAndValidateRegistry(
         if (attempt < maxRetries) {
           await new Promise((resolve) => setTimeout(resolve, 1000 * Math.pow(2, attempt - 1)));
         }
+      } finally {
+        clearTimeout(timeout);
       }
     }
   }

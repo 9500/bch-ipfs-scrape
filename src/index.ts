@@ -446,7 +446,7 @@ Options:
   --ipfs-pin-concurrency <num>  Parallel pin concurrency (1-200, default: 5)
   --json-folder <path>          Folder for cache and BCMR JSON (default: ./bcmr-registries)
   --json-concurrency <num>      Parallel JSON download concurrency (1-200, default: 10)
-  --max-file-size-mb <num>      Max JSON file size in MB (1-1000, default: 50)
+  --max-file-size-mb <num>      Max JSON file size in MB for download and processing (1-1000, default: 50)
   --ignore-json-hash            Store JSON files even if hash verification fails
                                 (computed hash still used for validation cache)
   --no-cache                    Disable authchain caching (force full resolution)
@@ -1473,8 +1473,9 @@ async function doFetchJson(options: {
   ignoreJsonHash?: boolean;
   concurrency?: number;
   config?: GatewayConfig;
+  maxFileSizeMB?: number;
 }): Promise<void> {
-  const { authheadFile, jsonFolder, validateSchema = false, ignoreJsonHash = false, concurrency = 10, config } = options;
+  const { authheadFile, jsonFolder, validateSchema = false, ignoreJsonHash = false, concurrency = 10, config, maxFileSizeMB = 50 } = options;
 
   // Load authhead.json
   console.log(`Reading ${authheadFile}...`);
@@ -1539,12 +1540,12 @@ async function doFetchJson(options: {
     // Check if file already exists locally
     if (existsSync(jsonPath)) {
       try {
-        const fileContent = readFileSync(jsonPath, 'utf-8');
-        const computedHash = createHash('sha256').update(fileContent).digest('hex');
+        const fileBytes = readFileSync(jsonPath);
+        const computedHash = createHash('sha256').update(fileBytes).digest('hex');
 
         if (computedHash === registry.hash) {
           // Hash matches, use existing file (skip network fetch)
-          registryJson = sanitizeJSON(JSON.parse(fileContent));
+          registryJson = sanitizeJSON(JSON.parse(new TextDecoder('utf-8').decode(fileBytes)));
           return { success: true, fetched: false, skipped: true, schemaInvalid: false };
         } else {
           // Hash mismatch, file is outdated or corrupted
@@ -1574,12 +1575,13 @@ async function doFetchJson(options: {
           validateSchema,
           validationCacheEntry,
           ignoreJsonHash,
-          config
+          config,
+          maxFileSizeMB * 1024 * 1024
         );
 
         if (fetchResult.success) {
-          // Save the raw JSON content (preserves exact formatting and hash)
-          writeFileSync(jsonPath, fetchResult.rawContent, 'utf-8');
+          // Save the exact bytes served (preserves formatting, BOM, and therefore the hash)
+          writeFileSync(jsonPath, fetchResult.rawBytes);
           registryJson = fetchResult.json;
 
           // Update validation cache if schema validation was performed
@@ -1806,6 +1808,7 @@ async function main(): Promise<void> {
         ignoreJsonHash: args.ignoreJsonHash,
         concurrency: args.jsonConcurrency,
         config: gatewayConfig,
+        maxFileSizeMB: args.maxFileSizeMB,
       });
     }
 
