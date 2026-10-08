@@ -8,6 +8,7 @@ import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync, statSyn
 import { getBCMRRegistries, fetchAndValidateRegistry, isValidUrlCharacters, chooseResolutionBackend, hasEmbeddedResolution, type GatewayConfig, type ResolveVia, type ChaingraphResultData, type BCMROutput } from './lib/bcmr.js';
 import { embedResolution, fetchBCMROutputs } from './lib/chaingraph-client.js';
 import { normalizeGatewayDomain, loadGatewayMapping } from './lib/gateway-config.js';
+import { writeFileAtomic } from './lib/atomic-write.js';
 import { closeConnectionPool } from './lib/fulcrum-client.js';
 import * as dotenv from 'dotenv';
 import { join } from 'path';
@@ -1450,13 +1451,8 @@ async function doIPFSPin(options: {
         totalCount: allPinnedCids.size,
       };
 
-      // Ensure folder exists
-      const cacheDir = pinCacheFile.substring(0, pinCacheFile.lastIndexOf('/'));
-      if (!existsSync(cacheDir)) {
-        mkdirSync(cacheDir, { recursive: true });
-      }
-
-      writeFileSync(pinCacheFile, JSON.stringify(cacheData, null, 2), 'utf-8');
+      // Temporary file + rename, so an interrupted save never truncates the cache
+      writeFileAtomic(pinCacheFile, JSON.stringify(cacheData, null, 2));
       console.log(`\n✓ Saved pin cache: ${allPinnedCids.size} total pinned CIDs (${newlyPinnedCids.size} newly added)`);
     } catch (error) {
       console.warn('Warning: Failed to save pin cache:', error);
@@ -1514,6 +1510,7 @@ async function doFetchJson(options: {
   let failedCount = 0;
   let skippedCount = 0;
   let schemaInvalidCount = 0;
+  let unvalidatedCount = 0; // Stored without schema validation because no validator was available
   let processedCount = 0;
   const startTime = Date.now();
 
@@ -1585,9 +1582,10 @@ async function doFetchJson(options: {
           writeFileSync(jsonPath, fetchResult.rawBytes);
           registryJson = fetchResult.json;
 
-          // Update validation cache if schema validation was performed
-          // Cache using the ACTUAL hash of the content (not the claimed hash from OP_RETURN)
-          if (validateSchema && validationCache) {
+          // Update validation cache only when the content was actually validated
+          // (never when the validator was unavailable). Cache using the ACTUAL
+          // hash of the content (not the claimed hash from OP_RETURN)
+          if (validateSchema && validationCache && fetchResult.schemaValidated) {
             validationCache.entries[fetchResult.computedHash] = {
               hash: fetchResult.computedHash,
               url: registry.uris[0] || 'unknown',
@@ -1595,6 +1593,10 @@ async function doFetchJson(options: {
               lastChecked: Date.now(),
               attemptCount: (validationCacheEntry?.attemptCount || 0) + 1,
             };
+          }
+
+          if (validateSchema && !fetchResult.schemaValidated) {
+            unvalidatedCount++;
           }
 
           return { success: true, fetched: true, skipped: false, schemaInvalid: false };
@@ -1673,6 +1675,9 @@ async function doFetchJson(options: {
   console.log(`  Used local cache: ${skippedCount}`);
   console.log(`  Total valid: ${validCount}`);
   console.log(`  Failed: ${failedCount}`);
+  if (validateSchema && unvalidatedCount > 0) {
+    console.warn(`  Stored without schema validation (validator unavailable): ${unvalidatedCount}`);
+  }
   if (validateSchema && schemaInvalidCount > 0) {
     console.log(`  Schema validation failures: ${schemaInvalidCount}`);
   }

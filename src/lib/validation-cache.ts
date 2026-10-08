@@ -3,8 +3,8 @@
  * Caches JSON schema validation results to avoid re-validating known-invalid content
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { readFileSync } from 'fs';
+import { writeFileAtomic } from './atomic-write.js';
 
 /**
  * Cache entry for a single JSON validation result
@@ -84,12 +84,9 @@ export function loadValidationCache(cachePath: string): ValidationCache {
  */
 export function saveValidationCache(cache: ValidationCache, cachePath: string): void {
   try {
-    // Ensure the directory exists
-    const dir = dirname(cachePath);
-    mkdirSync(dir, { recursive: true });
-
-    const jsonContent = JSON.stringify(cache, null, 2);
-    writeFileSync(cachePath, jsonContent, 'utf-8');
+    // Written to a temporary file and renamed into place, so a crash never
+    // leaves a truncated cache behind
+    writeFileAtomic(cachePath, JSON.stringify(cache, null, 2));
   } catch (error) {
     console.error(
       `Failed to save validation cache: ${error instanceof Error ? error.message : error}`

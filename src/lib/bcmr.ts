@@ -1310,7 +1310,20 @@ export function ipfsToGateway(uri: string): string {
  * Result types for fetchAndValidateRegistry
  */
 export type FetchValidateResult =
-  | { success: true; json: any; rawContent: string; rawBytes: Buffer; computedHash: string; hashVerified: boolean }
+  | {
+      success: true;
+      json: any;
+      rawContent: string;
+      rawBytes: Buffer;
+      computedHash: string;
+      hashVerified: boolean;
+      /**
+       * True when the content passed schema validation. False when validation
+       * was not requested, or when no validator was available: the content
+       * must then not be recorded as validated.
+       */
+      schemaValidated: boolean;
+    }
   | { success: false; schemaInvalid: true; computedHash: string; validationErrors: string[] }
   | { success: false; schemaInvalid: false };
 
@@ -1348,7 +1361,9 @@ export async function fetchAndValidateRegistry(
     return { success: false, schemaInvalid: false };
   }
 
-  for (const uri of uris) {
+  let validationWarned = false;
+
+  uriLoop: for (const uri of uris) {
     // Convert IPFS URIs to gateway URLs (with optional gateway rewriting)
     // An unsafe URI only disqualifies itself, not the registry's other URIs
     let resolved: ResolvedUrl;
@@ -1396,11 +1411,12 @@ export async function fetchAndValidateRegistry(
               `⚠️  Hash mismatch for ${urlDisplay}: expected ${expectedHash}, got ${computedHash} (continuing due to --ignore-json-hash)`
             );
           } else {
-            // Hash mismatch and ignoreJsonHash is disabled - fail
+            // Hash mismatch: this mirror serves the wrong bytes. Retrying it is
+            // pointless, but another URI of the registry may serve the right ones.
             console.warn(
-              `Hash mismatch for ${urlDisplay}: expected ${expectedHash}, got ${computedHash}`
+              `Hash mismatch for ${urlDisplay}: expected ${expectedHash}, got ${computedHash}; trying next URI`
             );
-            return { success: false, schemaInvalid: false }; // Hash mismatch - don't retry
+            continue uriLoop;
           }
         }
 
@@ -1415,10 +1431,18 @@ export async function fetchAndValidateRegistry(
           }
 
           // Schema validation (if enabled)
+          let schemaValidated = false;
           if (validateSchema) {
             const validation = await validateBCMRSchema(json);
 
-            if (!validation.isValid) {
+            if (validation.unavailable) {
+              // No validator could be built: store the (hash-verified) content
+              // but never record it as validated
+              if (!validationWarned) {
+                validationWarned = true;
+                console.warn(`Schema validation unavailable (${validation.reason}); ${urlDisplay} stored without validation`);
+              }
+            } else if (!validation.isValid) {
               console.warn(`Schema validation failed for ${urlDisplay}:`);
               // Show first 5 errors for readability
               validation.errors.slice(0, 5).forEach(err => console.warn(`  - ${err}`));
@@ -1432,11 +1456,13 @@ export async function fetchAndValidateRegistry(
                 computedHash,
                 validationErrors: validation.errors
               };
+            } else {
+              schemaValidated = true;
             }
           }
 
           // Success! Return parsed JSON, raw content, computed hash, and hash verification status
-          return { success: true, json, rawContent, rawBytes, computedHash, hashVerified };
+          return { success: true, json, rawContent, rawBytes, computedHash, hashVerified, schemaValidated };
         } catch (parseError) {
           console.warn(`JSON parse error from ${urlDisplay}:`, parseError);
           return { success: false, schemaInvalid: false };

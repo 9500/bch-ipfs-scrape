@@ -3,8 +3,8 @@
  * Caches authchain resolution results to avoid redundant Fulcrum queries
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { dirname } from 'path';
+import { readFileSync } from 'fs';
+import { writeFileAtomic } from './atomic-write.js';
 
 /**
  * Cache entry for a single authchain
@@ -96,12 +96,9 @@ export function loadAuthchainCache(cachePath: string): AuthchainCache {
  */
 export function saveAuthchainCache(cache: AuthchainCache, cachePath: string): void {
   try {
-    // Ensure the directory exists
-    const dir = dirname(cachePath);
-    mkdirSync(dir, { recursive: true });
-
-    const jsonContent = JSON.stringify(cache, null, 2);
-    writeFileSync(cachePath, jsonContent, 'utf-8');
+    // Written to a temporary file and renamed into place, so a crash never
+    // leaves a truncated cache behind
+    writeFileAtomic(cachePath, JSON.stringify(cache, null, 2));
   } catch (error) {
     console.error(
       `Failed to save cache: ${error instanceof Error ? error.message : error}`

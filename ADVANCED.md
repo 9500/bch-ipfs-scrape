@@ -237,7 +237,7 @@ Each cache entry (one per announcement transaction) stores:
 **Cache Updates:**
 - Cache is saved only on successful completion
 - Interrupted runs do not corrupt the cache
-- Atomic write ensures data integrity
+- Written to a temporary file and renamed into place, so a crash mid-write leaves the previous cache intact (the same applies to the validation and pin caches)
 
 **Cache Version:**
 
@@ -343,6 +343,10 @@ JSON file containing:
 ### Validation Cache
 
 **Purpose:** Prevents re-downloading and re-validating files known to be schema-invalid.
+
+**Schema source:** the BCMR v2 schema is bundled with the tool (`src/lib/bcmr-v2.schema.json`, from the chip-bcmr repository), so validation needs no network access. To validate against a different schema, set `BCMR_SCHEMA_URL`; it is fetched once per run, and if that fails the bundled schema is used for the rest of the run with a single warning. Content is only recorded in this cache when it was actually validated; if no validator could be built at all, hash-verified files are still stored but counted as "stored without schema validation" and left out of the cache.
+
+**Mirrors:** a URI whose content does not match the announced hash is skipped (not retried) and the registry's next URI is tried; the registry only fails once every URI served the wrong bytes.
 
 **Storage Location:** `bcmr-registries/.validation-cache.json`
 
