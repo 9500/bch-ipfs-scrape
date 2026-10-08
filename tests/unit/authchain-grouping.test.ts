@@ -23,16 +23,16 @@ function fakeBackend(spends: Record<string, string | null>, parents: Record<stri
   const spendCalls: string[] = [];
   const txCalls: string[] = [];
   const backend: AuthchainBackend = {
-    async getOutputSpendingTx(txid, vout) {
-      expect(vout).toBe(0);
+    name: 'fake',
+    async getSpendingTx(txid) {
       spendCalls.push(txid);
       if (!(txid in spends)) throw new Error(`unexpected spend lookup for ${txid}`);
       return spends[txid];
     },
-    async getTransaction(txid) {
+    async getParentTxId(txid) {
       txCalls.push(txid);
       if (!(txid in parents)) throw new Error(`unexpected tx lookup for ${txid}`);
-      return { vin: [{ txid: parents[txid], vout: 0 }] };
+      return parents[txid];
     },
   };
   return { backend, spendCalls, txCalls };
@@ -183,13 +183,14 @@ describe('getBCMRRegistries error handling', () => {
     // A -> B, but the spend lookup for B fails. C is an unrelated healthy identity.
     const spends: Record<string, string | null> = { [txA]: txB, [txC]: null };
     const backend: AuthchainBackend = {
-      async getOutputSpendingTx(txid) {
+      name: 'fake',
+      async getSpendingTx(txid) {
         if (txid === txB) throw new Error('Fulcrum request timed out');
         if (!(txid in spends)) throw new Error(`unexpected spend lookup for ${txid}`);
         return spends[txid];
       },
-      async getTransaction(txid) {
-        return { vin: [{ txid: txid === txC ? 'cc'.repeat(31) + '01' : categoryId, vout: 0 }] };
+      async getParentTxId(txid) {
+        return txid === txC ? 'cc'.repeat(31) + '01' : categoryId;
       },
     };
 

@@ -42,6 +42,7 @@ test(
       [
         cliPath,
         '--query-chaingraph',
+        '--no-embed-resolution', // the embedding pass takes minutes; these tests cover the query itself
         '--chaingraph-result-file',
         testOutputFile,
       ],
@@ -87,6 +88,7 @@ test(
       [
         cliPath,
         '--query-chaingraph',
+        '--no-embed-resolution', // the embedding pass takes minutes; these tests cover the query itself
         '--chaingraph-result-file',
         testOutputFile,
       ],
@@ -155,6 +157,7 @@ test(
         cliPath,
         '--query-chaingraph',
         customQueryPath,
+        '--no-embed-resolution', // the embedding pass takes minutes; these tests cover the query itself
         '--chaingraph-result-file',
         testOutputFile,
       ],

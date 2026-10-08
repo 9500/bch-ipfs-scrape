@@ -167,6 +167,7 @@ test(
       [
         cliPath,
         '--query-chaingraph',
+        '--no-embed-resolution', // the embedding pass takes minutes; these tests cover the query itself
         '--chaingraph-result-file',
         join(testCacheDir, 'query-result.json'),
         '--clear-cache', // This should be ignored

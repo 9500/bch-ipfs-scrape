@@ -5,7 +5,8 @@
  */
 
 import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync, statSync, readdirSync, realpathSync } from 'fs';
-import { getBCMRRegistries, fetchAndValidateRegistry, isValidUrlCharacters, type GatewayConfig } from './lib/bcmr.js';
+import { getBCMRRegistries, fetchAndValidateRegistry, isValidUrlCharacters, chooseResolutionBackend, hasEmbeddedResolution, type GatewayConfig, type ResolveVia, type ChaingraphResultData, type BCMROutput } from './lib/bcmr.js';
+import { embedResolution, fetchBCMROutputs } from './lib/chaingraph-client.js';
 import { closeConnectionPool } from './lib/fulcrum-client.js';
 import * as dotenv from 'dotenv';
 import { join } from 'path';
@@ -179,6 +180,9 @@ function parseArgs(): {
   showVersion: boolean;
   chaingraphQueryFile: string | null;
   chaingraphResultFile: string;
+  embedResolution: boolean;
+  resolveVia: ResolveVia;
+  ignoreEmbedded: boolean;
   ipfsGateway: string;
   rewriteGateways: boolean;
   targetGateway: string | null;
@@ -212,6 +216,9 @@ function parseArgs(): {
   let showVersion = false;
   let chaingraphQueryFile: string | null = null;
   let chaingraphResultFile = resolveWorkPath('./chaingraph-result.json');
+  let embedResolutionData = true; // --query-chaingraph embeds authchain resolution by default
+  let resolveVia: ResolveVia = 'auto';
+  let ignoreEmbedded = false;
   let ipfsGateway = 'ipfs.io'; // Default IPFS gateway
   let rewriteGateways = false;
   let targetGateway: string | null = null;
@@ -235,6 +242,18 @@ function parseArgs(): {
         console.error('Error: --chaingraph-result-file requires a path');
         process.exit(1);
       }
+      i++;
+    } else if (arg === '--no-embed-resolution') {
+      embedResolutionData = false;
+    } else if (arg === '--ignore-embedded') {
+      ignoreEmbedded = true;
+    } else if (arg === '--resolve-via') {
+      const value = args[i + 1];
+      if (value !== 'auto' && value !== 'file' && value !== 'chaingraph' && value !== 'fulcrum') {
+        console.error('Error: --resolve-via requires one of: auto, file, chaingraph, fulcrum');
+        process.exit(1);
+      }
+      resolveVia = value;
       i++;
     } else if (arg === '--export') {
       exportProtocols = args[i + 1];
@@ -405,6 +424,9 @@ function parseArgs(): {
     showVersion,
     chaingraphQueryFile,
     chaingraphResultFile,
+    embedResolution: embedResolutionData,
+    resolveVia,
+    ignoreEmbedded,
     ipfsGateway,
     rewriteGateways,
     targetGateway,
@@ -425,8 +447,9 @@ Commands:
   --query-chaingraph [file]     Query Chaingraph and save raw results to file
                                 Optional: provide custom GraphQL query file
                                 If no query file specified, uses default BCMR query
+                                Embeds authchain resolution so the file can be resolved offline
   --authchain-resolve           Resolve authchains from Chaingraph result file and save to authhead.json
-                                (requires --query-chaingraph to be run first)
+                                (requires a Chaingraph result file; see --resolve-via)
   --export <protocols>          Export URLs from authhead.json (IPFS, HTTPS, OTHER, ALL)
   --export-bcmr-ipfs-cids       Export IPFS CIDs from authhead.json (deduplicated, sorted)
   --export-cashtoken-ipfs-cids  Extract IPFS CIDs from BCMR JSON files (deduplicated, sorted)
@@ -438,6 +461,13 @@ Commands:
 
 Options:
   --chaingraph-result-file <path>  Path to save/load Chaingraph results (default: ./chaingraph-result.json)
+  --no-embed-resolution         Do not embed authchain resolution data when querying Chaingraph
+  --resolve-via <source>        Where --authchain-resolve gets blockchain answers:
+                                auto (default): Chaingraph if CHAINGRAPH_URL is set (Fulcrum as fallback
+                                  if FULCRUM_WS_URL is set), else Fulcrum, else the embedded snapshot
+                                file: embedded snapshot only, no network access
+                                chaingraph | fulcrum: force that live source
+  --ignore-embedded             Do not use resolution data embedded in the result file
   --authhead-file <path>        Path to authhead.json (default: ./authhead.json)
   --export-file <filename>      Export output filename (default: exported-urls.txt)
   --cids-file <filename>        BCMR CIDs output filename (default: bcmr-ipfs-cids.txt)
@@ -534,8 +564,10 @@ Protocol Filters:
   ALL    - All URIs regardless of protocol
 
 Environment Variables:
-  CHAINGRAPH_URL    GraphQL endpoint for Chaingraph (required for --query-chaingraph)
-  FULCRUM_WS_URL    Fulcrum WebSocket endpoint for authchain resolution (required for --authchain-resolve)
+  CHAINGRAPH_URL    GraphQL endpoint for Chaingraph (required for --query-chaingraph;
+                    used for --authchain-resolve when set)
+  FULCRUM_WS_URL    Fulcrum WebSocket endpoint for authchain resolution (used when set;
+                    not needed if CHAINGRAPH_URL is set or the result file carries a snapshot)
   BCMR_WORKDIR      Working directory for all output files (optional)
                     If set, all files/folders will be saved relative to this directory
                     If not set, files are saved in the current working directory
@@ -755,45 +787,12 @@ function extractCIDsFromURL(url: string): string[] {
 async function doQueryChaingraph(options: {
   chaingraphQueryFile: string | null;
   chaingraphResultFile: string;
+  embedResolution: boolean;
 }): Promise<void> {
-  const { chaingraphQueryFile, chaingraphResultFile } = options;
-
-  // Default GraphQL query for BCMR outputs
-  const DEFAULT_BCMR_QUERY = `
-  query SearchOutputsByLockingBytecodePrefix {
-    search_output_prefix(
-      args: { locking_bytecode_prefix_hex: "6a0442434d5220" }
-    ) {
-      locking_bytecode
-      output_index
-      transaction_hash
-      value_satoshis
-      transaction {
-        block_inclusions {
-          block {
-            hash
-            height
-          }
-        }
-      }
-      spent_by {
-        input_index
-        transaction {
-          hash
-          block_inclusions {
-            block {
-              hash
-              height
-            }
-          }
-        }
-      }
-    }
-  }
-`;
+  const { chaingraphQueryFile, chaingraphResultFile, embedResolution: embed } = options;
 
   // Load query from file or use default
-  let query: string;
+  let query: string | null = null;
   if (chaingraphQueryFile) {
     console.log(`Loading custom Chaingraph query from ${chaingraphQueryFile}...`);
     if (!existsSync(chaingraphQueryFile)) {
@@ -808,8 +807,7 @@ async function doQueryChaingraph(options: {
       process.exit(1);
     }
   } else {
-    console.log('Using default BCMR Chaingraph query...');
-    query = DEFAULT_BCMR_QUERY;
+    console.log('Using default BCMR Chaingraph query (paged)...');
   }
 
   const CHAINGRAPH_URL = process.env.CHAINGRAPH_URL || '';
@@ -822,41 +820,70 @@ async function doQueryChaingraph(options: {
   console.log(`Querying Chaingraph at ${CHAINGRAPH_URL}...`);
 
   try {
-    const response = await fetch(CHAINGRAPH_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        query,
-      }),
-    });
+    let data: ChaingraphResultData;
+    if (query) {
+      // Custom query: sent as-is, one request. Note that Chaingraph caps a
+      // request at 5000 rows; page with limit/offset in the query if needed.
+      const response = await fetch(CHAINGRAPH_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query,
+        }),
+      });
 
-    if (!response.ok) {
-      throw new Error(`Chaingraph request failed: ${response.status} ${response.statusText}`);
+      if (!response.ok) {
+        throw new Error(`Chaingraph request failed: ${response.status} ${response.statusText}`);
+      }
+
+      data = await response.json() as ChaingraphResultData;
+
+      if (data.errors) {
+        throw new Error(`GraphQL errors: ${JSON.stringify(data.errors, null, 2)}`);
+      }
+    } else {
+      const rows = await fetchBCMROutputs<BCMROutput>({
+        onPage: (fetched) => console.log(`  Fetched ${fetched} BCMR outputs...`),
+      });
+      data = { data: { search_output_prefix: rows } };
     }
 
-    const data = await response.json() as {
-      data?: { search_output_prefix?: any[] };
-      errors?: Array<{ message: string }>;
-    };
-
-    if (data.errors) {
-      throw new Error(`GraphQL errors: ${JSON.stringify(data.errors, null, 2)}`);
+    const outputs = data.data?.search_output_prefix;
+    if (outputs) {
+      console.log(`  Found ${outputs.length} BCMR outputs`);
     }
 
-    // Save raw result to file
-    const jsonContent = JSON.stringify(data, null, 2);
+    // Embed authchain resolution (authhead, chain length, token category) so
+    // that consumers of this file can resolve registries with no blockchain
+    // access at all, and so a live run only has to verify instead of walk.
+    let meta: ChaingraphResultData['meta'] = { generatedAt: new Date().toISOString(), embeddedResolution: false };
+    if (embed && outputs && outputs.length > 0) {
+      console.log(`Embedding authchain resolution for ${outputs.length} outputs (server-side, may take a few minutes)...`);
+      const started = Date.now();
+      const result = await embedResolution(outputs, {
+        onProgress: (phase, done, total) => {
+          if (done % 500 === 0 || done === total) {
+            console.log(`  ${phase}: ${done}/${total} (${((Date.now() - started) / 1000).toFixed(0)}s)`);
+          }
+        },
+      });
+      meta = { generatedAt: new Date().toISOString(), embeddedResolution: result.embedded > 0 };
+      console.log(`  Embedded resolution for ${result.embedded}/${outputs.length} outputs (${result.unspent} unspent, ${result.resolved} resolved server-side)`);
+      if (result.failed > 0) {
+        console.warn(`  Warning: ${result.failed} transactions could not be resolved by Chaingraph and carry no embedded data; a live run will resolve them`);
+      }
+    } else if (!embed) {
+      console.log('Skipping resolution embedding (--no-embed-resolution)');
+    }
+
+    // Save result to file (raw GraphQL response plus metadata)
+    const jsonContent = JSON.stringify({ meta, ...data }, null, 2);
     writeFileSync(chaingraphResultFile, jsonContent, 'utf-8');
 
     console.log(`\n✓ Chaingraph query successful`);
     console.log(`  Result saved to: ${chaingraphResultFile}`);
-
-    // Show basic statistics if it's the standard query format
-    if (data.data?.search_output_prefix) {
-      const outputs = data.data.search_output_prefix;
-      console.log(`  Found ${outputs.length} BCMR outputs`);
-    }
   } catch (error) {
     console.error('Error querying Chaingraph:', error instanceof Error ? error.message : error);
     process.exit(1);
@@ -875,8 +902,10 @@ async function doAuthchainResolve(options: {
   verbose: boolean;
   concurrency: number;
   chaingraphResultFile: string;
+  resolveVia: ResolveVia;
+  ignoreEmbedded: boolean;
 }): Promise<void> {
-  const { authheadFile, jsonFolder, useCache, clearCache, verbose, concurrency, chaingraphResultFile } = options;
+  const { authheadFile, jsonFolder, useCache, clearCache, verbose, concurrency, chaingraphResultFile, resolveVia, ignoreEmbedded } = options;
 
   // Load Chaingraph data from file
   console.log(`Loading Chaingraph data from ${chaingraphResultFile}...`);
@@ -887,7 +916,7 @@ async function doAuthchainResolve(options: {
     process.exit(1);
   }
 
-  let chaingraphData: { data?: { search_output_prefix?: any[] } };
+  let chaingraphData: ChaingraphResultData;
   try {
     const fileContent = readFileSync(chaingraphResultFile, 'utf-8');
     chaingraphData = JSON.parse(fileContent);
@@ -898,8 +927,24 @@ async function doAuthchainResolve(options: {
     }
 
     console.log(`Loaded ${chaingraphData.data.search_output_prefix.length} BCMR outputs from file`);
+    if (chaingraphData.meta?.generatedAt) {
+      console.log(`  Generated ${chaingraphData.meta.generatedAt}`);
+    }
   } catch (error) {
     console.error(`Error reading Chaingraph result file: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+
+  // Pick where blockchain answers come from: embedded snapshot, Chaingraph, Fulcrum
+  const snapshotAvailable = !ignoreEmbedded && hasEmbeddedResolution(chaingraphData);
+  if (hasEmbeddedResolution(chaingraphData)) {
+    console.log(`  Result file carries embedded authchain resolution${ignoreEmbedded ? ' (ignored by --ignore-embedded)' : ''}`);
+  }
+  let backend;
+  try {
+    backend = chooseResolutionBackend(resolveVia, snapshotAvailable);
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : error}`);
     process.exit(1);
   }
 
@@ -910,7 +955,17 @@ async function doAuthchainResolve(options: {
     verbose,
     concurrency,
     chaingraphData,
+    backend,
+    useSnapshot: !ignoreEmbedded,
   });
+
+  if (backend === null) {
+    console.log(
+      `\nNote: resolved from the snapshot embedded in ${chaingraphResultFile}` +
+        (chaingraphData.meta?.generatedAt ? ` (generated ${chaingraphData.meta.generatedAt})` : '') +
+        '. Authheads were not verified against the blockchain.'
+    );
+  }
 
   // Every entry is one BCMR announcement. Announcements of the same identity
   // share an authhead; only the newest one (isSuperseded === false) is current.
@@ -1731,13 +1786,8 @@ async function main(): Promise<void> {
       }
     }
 
-    if (args.authchainResolve) {
-      if (!process.env.FULCRUM_WS_URL) {
-        console.error('Error: FULCRUM_WS_URL environment variable is not set');
-        console.error('Please add FULCRUM_WS_URL=<your-fulcrum-ws-url> to .env file');
-        process.exit(1);
-      }
-    }
+    // --authchain-resolve can run from CHAINGRAPH_URL, FULCRUM_WS_URL, or the
+    // snapshot embedded in the result file; the check happens once the file is loaded.
 
     // Handle cache clearing (only for authchain-resolve)
     if (args.clearCache && args.authchainResolve) {
@@ -1797,6 +1847,7 @@ async function main(): Promise<void> {
       await doQueryChaingraph({
         chaingraphQueryFile: args.chaingraphQueryFile,
         chaingraphResultFile: args.chaingraphResultFile,
+        embedResolution: args.embedResolution,
       });
     }
 
@@ -1809,6 +1860,8 @@ async function main(): Promise<void> {
         verbose: args.verbose,
         concurrency: args.concurrency,
         chaingraphResultFile: args.chaingraphResultFile,
+        resolveVia: args.resolveVia,
+        ignoreEmbedded: args.ignoreEmbedded,
       });
     }
 

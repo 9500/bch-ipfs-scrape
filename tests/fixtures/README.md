@@ -15,6 +15,7 @@ Chaingraph GraphQL query responses
 **Current files:**
 - `sample-100-registries.json`, `sample-200-registries.json` - Real announcements, used by the live integration tests
 - `three-tx-chain.json` - Synthetic authchain `A -> B -> C` (three announcements of one identity, listed out of order), used by `tests/unit/authchain-grouping.test.ts` with a fake backend
+- `short-chains-embedded.json` - `short-chains-full.json` with Chaingraph's authchain resolution and input-0 outpoints embedded (as `--query-chaingraph` produces them), used by `tests/integration/cli-resolve-file-only.test.ts` to resolve with no endpoints at all
 - `short-chains-half.json`, `short-chains-full.json` - Subset of `sample-200-registries.json` restricted to identities whose authchains are at most 3 hops long, used by the live integration tests so a full walk takes seconds. The half file is a prefix of the full file. `sample-200-registries.json` itself contains identities whose auth UTXO was swept into busy wallets (chains of hundreds of hops), which take minutes to walk honestly.
 
 **Source:** Shorten your real `chaingraph-result.json` file

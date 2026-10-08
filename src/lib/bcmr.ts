@@ -4,6 +4,7 @@
  */
 
 import { getOutputSpendingTx, getTransaction, getFulcrumStats } from './fulcrum-client.js';
+import { createChaingraphBackend, chainResolutionFromRow, fetchBCMROutputs, fromBytea, type AuthchainRow } from './chaingraph-client.js';
 import { createHash } from 'crypto';
 import type { AuthchainCache, AuthchainCacheEntry } from './authchain-cache.js';
 import {
@@ -15,41 +16,7 @@ import {
 import { validateBCMRSchema } from './schema-validator.js';
 import { isInternalHostname, safeFetch } from './ssrf.js';
 
-// GraphQL query to fetch all BCMR outputs using prefix search
-const BCMR_QUERY = `
-  query SearchOutputsByLockingBytecodePrefix {
-    search_output_prefix(
-      args: { locking_bytecode_prefix_hex: "6a0442434d5220" }
-    ) {
-      locking_bytecode
-      output_index
-      transaction_hash
-      value_satoshis
-      transaction {
-        block_inclusions {
-          block {
-            hash
-            height
-          }
-        }
-      }
-      spent_by {
-        input_index
-        transaction {
-          hash
-          block_inclusions {
-            block {
-              hash
-              height
-            }
-          }
-        }
-      }
-    }
-  }
-`;
-
-interface BCMROutput {
+export interface BCMROutput {
   locking_bytecode: string;
   output_index: string | number; // Chaingraph returns as string
   transaction_hash: string;
@@ -61,6 +28,9 @@ interface BCMROutput {
         height: string | number; // Chaingraph returns as string
       };
     }>;
+    /** Present when the result file was produced with embedded resolution */
+    authchains?: AuthchainRow[];
+    inputs?: Array<{ outpoint_transaction_hash: string; outpoint_index?: string | number }>;
   };
   spent_by: Array<{
     input_index: string | number; // Chaingraph returns as string
@@ -269,41 +239,162 @@ function isOutputBurned(output: BCMROutput): boolean {
 }
 
 /**
- * Minimal subset of the Fulcrum client used during authchain resolution.
- * Injectable so the resolution logic can be unit-tested with a fake backend.
+ * Result of resolving a whole authchain in one step (server-side)
  */
-export interface AuthchainBackend {
-  /** Return the txid spending `txid:vout`, or null if that output is unspent */
-  getOutputSpendingTx: (txid: string, vout: number) => Promise<string | null>;
-  /** Return a decoded transaction (only `vin[0].txid` is used) */
-  getTransaction: (txid: string) => Promise<{ vin: Array<{ txid?: string }> }>;
+export interface ChainResolution {
+  authhead: string;
+  chainLength: number; // Transactions from the queried tx to the authhead, inclusive
+  isActive: boolean;   // Whether the authhead's output 0 is unspent
 }
 
-const defaultBackend: AuthchainBackend = { getOutputSpendingTx, getTransaction };
+/**
+ * Source of blockchain answers for authchain resolution.
+ * Implemented by the Fulcrum client and the Chaingraph client; tests inject fakes.
+ */
+export interface AuthchainBackend {
+  /** Human-readable name for the run summary */
+  name: string;
+  /** Return the txid spending output 0 of `txid`, or null if that output is unspent */
+  getSpendingTx: (txid: string) => Promise<string | null>;
+  /** Return the txid spent by input 0 of `txid` (the token category for a genesis), or null if none */
+  getParentTxId: (txid: string) => Promise<string | null>;
+  /** Optional: resolve the whole chain starting at `txid` in one call */
+  resolveChain?: (txid: string) => Promise<ChainResolution>;
+  /** Optional: counters for the run summary */
+  getStats?: () => Record<string, number>;
+}
 
 /**
- * Get the parent transaction ID of a given transaction
- * Returns the txid of the first input (vin[0].txid)
- *
- * When `txid` is a CashToken genesis transaction this is the token category ID.
- * For an authchain *update* transaction it is merely the previous transaction in
- * the chain, so callers must only use this on the earliest transaction of an
- * authchain.
- *
- * @param txid - Transaction hash to get parent of
- * @param backend - Blockchain backend
- * @returns Parent transaction ID, or null if the transaction has no previous output (coinbase)
- * @throws If the transaction cannot be fetched
+ * Resolution backend answering from Fulcrum
  */
-async function getParentTxId(txid: string, backend: AuthchainBackend): Promise<string | null> {
-  const tx = await backend.getTransaction(txid);
+export function createFulcrumBackend(): AuthchainBackend {
+  const started = getFulcrumStats();
+  return {
+    name: `fulcrum (${process.env.FULCRUM_WS_URL ?? 'FULCRUM_WS_URL'})`,
+    getSpendingTx: (txid) => getOutputSpendingTx(txid, 0),
+    getParentTxId: async (txid) => {
+      const tx = await getTransaction(txid);
+      // Coinbase inputs have no previous output
+      return tx.vin && tx.vin.length > 0 && tx.vin[0].txid ? tx.vin[0].txid : null;
+    },
+    getStats: () => {
+      const now = getFulcrumStats();
+      return {
+        'Electrum RPC calls': now.rpcCalls - started.rpcCalls,
+        'Fulcrum timeouts': now.timeouts - started.timeouts,
+        'Fulcrum dropped requests': now.droppedRequests - started.droppedRequests,
+        'Fulcrum connections lost': now.connectionsLost - started.connectionsLost,
+      };
+    },
+  };
+}
 
-  // Return first input's txid (parent transaction); coinbase inputs have none
-  if (tx.vin && tx.vin.length > 0 && tx.vin[0].txid) {
-    return tx.vin[0].txid;
+/**
+ * Use `primary` and fall back to `secondary` for any lookup the primary fails
+ */
+export function withFallback(primary: AuthchainBackend, secondary: AuthchainBackend): AuthchainBackend {
+  let fallbacks = 0;
+  let warned = false;
+  const fallback = async <T>(what: string, txid: string, first: () => Promise<T>, second: () => Promise<T>): Promise<T> => {
+    try {
+      return await first();
+    } catch (error) {
+      fallbacks++;
+      if (!warned) {
+        warned = true;
+        console.warn(
+          `Warning: ${primary.name} failed for ${what} ${txid} (${error instanceof Error ? error.message : error}); falling back to ${secondary.name}`
+        );
+      }
+      return second();
+    }
+  };
+  return {
+    name: `${primary.name} with fallback to ${secondary.name}`,
+    getSpendingTx: (txid) => fallback('spend lookup', txid, () => primary.getSpendingTx(txid), () => secondary.getSpendingTx(txid)),
+    getParentTxId: (txid) => fallback('parent lookup', txid, () => primary.getParentTxId(txid), () => secondary.getParentTxId(txid)),
+    // Only the primary can resolve whole chains; a failure falls back to walking
+    resolveChain: primary.resolveChain,
+    getStats: () => ({
+      ...(primary.getStats?.() ?? {}),
+      ...(secondary.getStats?.() ?? {}),
+      'Lookups that fell back': fallbacks,
+    }),
+  };
+}
+
+export type ResolveVia = 'auto' | 'file' | 'chaingraph' | 'fulcrum';
+
+/**
+ * Pick the resolution backend for a run.
+ *
+ * - `auto`: live Chaingraph when CHAINGRAPH_URL is set (with Fulcrum as fallback
+ *   when FULCRUM_WS_URL is also set), else Fulcrum, else the embedded snapshot.
+ * - `file`: embedded snapshot only (no network).
+ * - `chaingraph` / `fulcrum`: force that live source.
+ *
+ * @returns The backend, or null for snapshot-only resolution
+ * @throws When the requested source is not available
+ */
+export function chooseResolutionBackend(
+  resolveVia: ResolveVia,
+  hasSnapshot: boolean,
+  env: { CHAINGRAPH_URL?: string; FULCRUM_WS_URL?: string } = { CHAINGRAPH_URL: process.env.CHAINGRAPH_URL, FULCRUM_WS_URL: process.env.FULCRUM_WS_URL }
+): AuthchainBackend | null {
+  const chaingraphUrl = env.CHAINGRAPH_URL;
+  const fulcrumUrl = env.FULCRUM_WS_URL;
+
+  switch (resolveVia) {
+    case 'file':
+      if (!hasSnapshot) {
+        throw new Error(
+          'The Chaingraph result file has no embedded resolution data; produce it with --query-chaingraph (embedding is on by default) or choose another --resolve-via source'
+        );
+      }
+      return null;
+    case 'chaingraph':
+      if (!chaingraphUrl) throw new Error('--resolve-via chaingraph requires CHAINGRAPH_URL');
+      return createChaingraphBackend({ url: chaingraphUrl });
+    case 'fulcrum':
+      if (!fulcrumUrl) throw new Error('--resolve-via fulcrum requires FULCRUM_WS_URL');
+      return createFulcrumBackend();
+    case 'auto':
+    default:
+      if (chaingraphUrl && fulcrumUrl) {
+        return withFallback(createChaingraphBackend({ url: chaingraphUrl }), createFulcrumBackend());
+      }
+      if (chaingraphUrl) return createChaingraphBackend({ url: chaingraphUrl });
+      if (fulcrumUrl) return createFulcrumBackend();
+      if (hasSnapshot) return null;
+      throw new Error(
+        'No resolution source: set CHAINGRAPH_URL or FULCRUM_WS_URL, or use a Chaingraph result file with embedded resolution data'
+      );
   }
+}
 
-  return null;
+/**
+ * Embedded (snapshot) resolution data carried by a Chaingraph result row
+ */
+interface SnapshotData {
+  entry: AuthchainCacheEntry | null; // null when the row carries no authchain
+  parentTxId: string | null;         // null when unknown
+}
+
+function snapshotFromOutput(output: BCMROutput, txHash: string, timestamp: number): SnapshotData {
+  const row = output.transaction?.authchains?.[0];
+  const outpoint = output.transaction?.inputs?.[0]?.outpoint_transaction_hash;
+  let entry: AuthchainCacheEntry | null = null;
+  if (row) {
+    const resolution = chainResolutionFromRow(row);
+    entry = {
+      authbase: txHash,
+      authhead: resolution.authhead,
+      chainLength: resolution.chainLength,
+      isActive: resolution.isActive,
+      lastCheckedTimestamp: timestamp,
+    };
+  }
+  return { entry, parentTxId: outpoint ? fromBytea(outpoint) : null };
 }
 
 /**
@@ -313,10 +404,12 @@ interface AuthchainResolutionResult {
   entry: AuthchainCacheEntry;
   /**
    * Number of output-0 spend lookups performed. Lookups are memoised per run,
-   * so this can exceed the number of real Fulcrum queries.
+   * so this can exceed the number of real backend queries.
    */
   lookups: number;
-  cacheHitType: 'perfect' | 'good' | 'partial' | 'miss';
+  cacheHitType: 'perfect' | 'good' | 'partial' | 'miss' | 'snapshot';
+  /** True when the tail of the chain was resolved server-side in one call */
+  escalated?: boolean;
   /**
    * Set when the walk was aborted by a backend error. `entry` then describes
    * the last position reached, with `isActive = false`, and must not be cached.
@@ -328,6 +421,9 @@ interface AuthchainResolutionResult {
  * Looks up the transaction spending output 0 of `txid` (null if unspent)
  */
 type SpendLookup = (txid: string) => Promise<string | null>;
+
+/** Hops walked in one run before a whole-chain resolver (if any) takes over */
+const DEFAULT_ESCALATE_AFTER_HOPS = 25;
 
 /**
  * Resolve authchain to find the current authhead
@@ -341,15 +437,23 @@ type SpendLookup = (txid: string) => Promise<string | null>;
  * @param startTxid - Transaction hash to start walking from (a BCMR announcement)
  * @param lookupSpendingTx - Output-0 spend lookup (memoised by the caller)
  * @param cache - Optional cache to check for existing authchain data
+ * @param resolveChain - Optional whole-chain resolver used once a walk gets long
+ * @param escalateAfterHops - Hops walked before handing over to `resolveChain`
  * @returns Resolution result with cache entry, lookup count, and hit type
  */
 async function resolveAuthchain(
   startTxid: string,
   lookupSpendingTx: SpendLookup,
-  cache?: AuthchainCache
+  cache?: AuthchainCache,
+  resolveChain?: (txid: string) => Promise<ChainResolution>,
+  escalateAfterHops: number = DEFAULT_ESCALATE_AFTER_HOPS
 ): Promise<AuthchainResolutionResult> {
   const cachedEntry = cache?.entries[startTxid];
-  const maxChainLength = 1000;
+  // Cap on hops walked in one run. It bounds the work for an auth UTXO that
+  // drifted into endless wallet traffic; it is not a cap on chain length, so
+  // a seed (cache or snapshot) that is already thousands of hops along still
+  // costs a single lookup.
+  const maxHopsPerRun = 1000;
 
   // OPTIMIZATION 1: Inactive chains (exceeded max length) never become active again
   if (cachedEntry && !cachedEntry.isActive) {
@@ -374,9 +478,29 @@ async function resolveAuthchain(
   }
 
   let lookups = 0;
+  let hopsThisRun = 0;
 
   try {
-    while (chainLength < maxChainLength) {
+    while (hopsThisRun < maxHopsPerRun) {
+      // A long walk means the auth UTXO drifted into ordinary wallet traffic.
+      // Hand the rest to the server-side resolver when one is available.
+      if (resolveChain && hopsThisRun >= escalateAfterHops) {
+        const rest = await resolveChain(currentTxid);
+        lookups++;
+        return {
+          entry: {
+            authbase: startTxid,
+            authhead: rest.authhead,
+            chainLength: chainLength + rest.chainLength - 1,
+            isActive: rest.isActive,
+            lastCheckedTimestamp: Date.now(),
+          },
+          lookups,
+          cacheHitType,
+          escalated: true,
+        };
+      }
+
       const spendingTxid = await lookupSpendingTx(currentTxid);
       lookups++;
 
@@ -398,14 +522,15 @@ async function resolveAuthchain(
       // Output 0 is spent, follow the chain
       currentTxid = spendingTxid;
       chainLength++;
+      hopsThisRun++;
       if (cachedEntry) {
         cacheHitType = 'partial';
       }
     }
 
-    // Hit max chain length
+    // Hit the per-run hop cap
     console.warn(
-      `Warning: Authchain exceeded maximum length of ${maxChainLength} for ${startTxid}`
+      `Warning: Authchain walk exceeded ${maxHopsPerRun} hops in one run for ${startTxid} (chain length so far ${chainLength})`
     );
     return {
       entry: {
@@ -433,6 +558,22 @@ async function resolveAuthchain(
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+/**
+ * Shape of a Chaingraph result file (raw GraphQL response plus optional metadata)
+ */
+export interface ChaingraphResultData {
+  meta?: { generatedAt?: string; embeddedResolution?: boolean };
+  data?: { search_output_prefix?: BCMROutput[] };
+  errors?: Array<{ message: string }>;
+}
+
+/**
+ * True when at least one row of the Chaingraph data carries embedded resolution
+ */
+export function hasEmbeddedResolution(data: ChaingraphResultData | undefined): boolean {
+  return Boolean(data?.data?.search_output_prefix?.some((o) => o.transaction?.authchains?.length));
 }
 
 /**
@@ -473,22 +614,29 @@ function announcementHeight(output: BCMROutput): number {
  * @param options.verbose - Enable verbose logging for detailed diagnostics (default: false)
  * @param options.concurrency - Number of parallel authchain resolutions (default: 50)
  * @param options.chaingraphData - Pre-loaded Chaingraph data (if provided, skips Chaingraph query)
- * @param options.backend - Blockchain backend (default: Fulcrum client; override for tests)
+ * @param options.backend - Resolution backend (default: Fulcrum). `null` resolves from the
+ *   snapshot embedded in the Chaingraph data only, without any network access.
+ * @param options.useSnapshot - Seed resolution from embedded snapshot data when present (default: true)
+ * @param options.escalateAfterHops - Hops walked before a whole-chain resolver takes over (default: 25)
  */
 export async function getBCMRRegistries(options?: {
   useCache?: boolean;
   cachePath?: string;
   verbose?: boolean;
   concurrency?: number;
-  chaingraphData?: { data?: { search_output_prefix?: BCMROutput[] } };
-  backend?: AuthchainBackend;
+  chaingraphData?: ChaingraphResultData;
+  backend?: AuthchainBackend | null;
+  useSnapshot?: boolean;
+  escalateAfterHops?: number;
 }): Promise<BCMRRegistry[]> {
   const useCache = options?.useCache !== false;
   const cachePath = options?.cachePath || './bcmr-registries/.authchain-cache.json';
   const verbose = options?.verbose || false;
   const concurrency = options?.concurrency || 50;
   const chaingraphData = options?.chaingraphData;
-  const backend = options?.backend ?? defaultBackend;
+  const backend: AuthchainBackend | null = options?.backend === undefined ? createFulcrumBackend() : options.backend;
+  const useSnapshot = options?.useSnapshot !== false;
+  const escalateAfterHops = options?.escalateAfterHops ?? DEFAULT_ESCALATE_AFTER_HOPS;
 
   try {
     // Load cache if enabled
@@ -522,45 +670,16 @@ export async function getBCMRRegistries(options?: {
     }
 
     // Use pre-loaded data or fetch from Chaingraph
-    let data: {
-      data?: { search_output_prefix?: BCMROutput[] };
-      errors?: Array<{ message: string }>;
-    };
+    let data: ChaingraphResultData;
 
     if (chaingraphData) {
       // Use pre-loaded data
       console.log('Using pre-loaded Chaingraph data...');
       data = chaingraphData;
     } else {
-      // Fetch from Chaingraph
-      const CHAINGRAPH_URL = process.env.CHAINGRAPH_URL || '';
-
-      if (!CHAINGRAPH_URL) {
-        throw new Error('CHAINGRAPH_URL environment variable is not set');
-      }
-
-      const response = await fetch(CHAINGRAPH_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          query: BCMR_QUERY,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Chaingraph request failed: ${response.status}`);
-      }
-
-      data = (await response.json()) as {
-        data?: { search_output_prefix?: BCMROutput[] };
-        errors?: Array<{ message: string }>;
-      };
-
-      if (data.errors) {
-        throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
-      }
+      // Fetch from Chaingraph (paged; a single request is capped at 5000 rows)
+      const outputsFromChaingraph = await fetchBCMROutputs<BCMROutput>();
+      data = { data: { search_output_prefix: outputsFromChaingraph } };
     }
 
     const outputs: BCMROutput[] = data.data?.search_output_prefix || [];
@@ -568,16 +687,62 @@ export async function getBCMRRegistries(options?: {
     // Filter to keep only first BCMR output per transaction
     const validOutputs = filterFirstOutputOnly(outputs);
 
+    // Embedded snapshot: resolution data the producer of the result file
+    // fetched from Chaingraph. Without a live backend it is the answer; with
+    // one it seeds the cache so each identity costs a single "still unspent?"
+    // lookup instead of a walk.
+    const snapshotTime = Date.parse(data.meta?.generatedAt ?? '') || Date.now();
+    const snapshots = new Map<string, SnapshotData>();
+    if (useSnapshot) {
+      for (const output of validOutputs) {
+        const txHash = stripHexPrefix(output.transaction_hash);
+        const snapshot = snapshotFromOutput(output, txHash, snapshotTime);
+        if (snapshot.entry || snapshot.parentTxId) {
+          snapshots.set(txHash, snapshot);
+        }
+      }
+    }
+    const snapshotCount = Array.from(snapshots.values()).filter((s) => s.entry).length;
+
+    if (backend === null) {
+      console.log(
+        `Resolving from the embedded snapshot only (${snapshotCount}/${validOutputs.length} announcements carry resolution data` +
+          (data.meta?.generatedAt ? `, generated ${data.meta.generatedAt}` : '') +
+          '); no live verification'
+      );
+    } else {
+      console.log(`Resolution backend: ${backend.name}`);
+      if (snapshotCount > 0) {
+        console.log(`  Seeding from embedded snapshot: ${snapshotCount} announcements`);
+        let seeded = 0;
+        const seedCache = oldCache ?? createEmptyCache();
+        for (const [txHash, snapshot] of snapshots) {
+          if (!snapshot.entry || !snapshot.entry.isActive) continue;
+          const existing = seedCache.entries[txHash];
+          // The seed that is furthest along the chain saves the most hops
+          if (!existing || (existing.isActive && snapshot.entry.chainLength > existing.chainLength)) {
+            seedCache.entries[txHash] = { ...snapshot.entry, parentTxId: existing?.parentTxId };
+            seeded++;
+          }
+        }
+        oldCache = seedCache;
+        if (verbose) console.log(`  ${seeded} cache entries seeded or advanced by the snapshot`);
+      }
+    }
+
     // Memoise output-0 spend lookups for this run. Every announcement of an
     // identity walks the same tail of the chain to the shared authhead, so
     // without memoisation that tail is queried once per announcement.
     const spendMemo = new Map<string, Promise<string | null>>();
-    let fulcrumSpendQueries = 0;
+    let spendQueries = 0;
     const lookupSpendingTx: SpendLookup = (txid) => {
       let pending = spendMemo.get(txid);
       if (!pending) {
-        fulcrumSpendQueries++;
-        pending = backend.getOutputSpendingTx(txid, 0).catch((error) => {
+        if (backend === null) {
+          return Promise.reject(new Error('No embedded resolution data for this announcement and no live backend'));
+        }
+        spendQueries++;
+        pending = backend.getSpendingTx(txid).catch((error) => {
           spendMemo.delete(txid); // Don't memoise failures
           throw error;
         });
@@ -585,6 +750,7 @@ export async function getBCMRRegistries(options?: {
       }
       return pending;
     };
+    const resolveChain = backend?.resolveChain ? (txid: string) => backend.resolveChain!(txid) : undefined;
 
     // Build new cache as we process announcements
     const newCache = createEmptyCache();
@@ -595,11 +761,13 @@ export async function getBCMRRegistries(options?: {
     let goodCacheHits = 0;      // Active chains still unspent (1 lookup)
     let partialCacheHits = 0;   // Active chains continued from cache (N lookups)
     let cacheMisses = 0;        // No cache entry (full walk)
+    let snapshotHits = 0;       // Answered by the embedded snapshot (no backend)
+    let escalations = 0;        // Long walks finished by the server-side resolver
     let totalLookups = 0;
     let processedCount = 0;
     let resolutionErrors = 0;   // Walks aborted by a backend error (not cached)
     let tokenIdErrors = 0;      // Identities skipped because the tokenId lookup failed
-    const fulcrumStatsAtStart = getFulcrumStats();
+    let parentLookups = 0;      // tokenId lookups that needed the backend
 
     console.log(`Resolving authchains for ${validOutputs.length} announcements (concurrency: ${concurrency})...`);
     const startTime = Date.now();
@@ -617,7 +785,21 @@ export async function getBCMRRegistries(options?: {
       // Strip hex prefix from transaction hash
       const txHash = stripHexPrefix(output.transaction_hash);
 
-      const resolution = await resolveAuthchain(txHash, lookupSpendingTx, oldCache);
+      if (backend === null) {
+        // Snapshot-only: the embedded answer is final
+        const entry = snapshots.get(txHash)?.entry;
+        const resolution: AuthchainResolutionResult = entry
+          ? { entry, lookups: 0, cacheHitType: 'snapshot' }
+          : {
+              entry: { authbase: txHash, authhead: txHash, chainLength: 1, isActive: false, lastCheckedTimestamp: Date.now() },
+              lookups: 0,
+              cacheHitType: 'snapshot',
+              error: 'No embedded resolution data for this announcement (re-run --query-chaingraph or use a live source)',
+            };
+        return { txHash, output, parsed, resolution };
+      }
+
+      const resolution = await resolveAuthchain(txHash, lookupSpendingTx, oldCache, resolveChain, escalateAfterHops);
 
       return { txHash, output, parsed, resolution };
     };
@@ -649,6 +831,12 @@ export async function getBCMRRegistries(options?: {
             case 'miss':
               cacheMisses++;
               break;
+            case 'snapshot':
+              snapshotHits++;
+              break;
+          }
+          if (resolution.escalated) {
+            escalations++;
           }
 
           if (resolution.error) {
@@ -671,6 +859,7 @@ export async function getBCMRRegistries(options?: {
               good: `good hit (1 lookup)`,
               partial: `partial hit (${resolution.lookups} lookups)`,
               miss: `miss (${resolution.lookups} lookups)`,
+              snapshot: 'embedded snapshot (0 lookups)',
             };
 
             console.log(
@@ -755,8 +944,18 @@ export async function getBCMRRegistries(options?: {
         ];
       }
 
+      // The parent of a transaction never changes: prefer the snapshot, then the
+      // cache, and only then ask the backend.
+      const known = snapshots.get(earliest.txHash)?.parentTxId ?? oldCache?.entries[earliest.txHash]?.parentTxId ?? null;
       try {
-        tokenId = await getParentTxId(earliest.txHash, backend);
+        if (known) {
+          tokenId = known;
+        } else if (backend === null) {
+          throw new Error('no embedded parent transaction');
+        } else {
+          parentLookups++;
+          tokenId = await backend.getParentTxId(earliest.txHash);
+        }
       } catch (error) {
         tokenIdErrors++;
         console.warn(
@@ -768,6 +967,12 @@ export async function getBCMRRegistries(options?: {
         tokenIdErrors++;
         console.warn(`Warning: authbase ${earliest.txHash} has no parent transaction, skipping identity`);
         return [];
+      }
+
+      // Remember the parent so later runs skip this lookup
+      const cachedAuthbase = newCache.entries[earliest.txHash];
+      if (cachedAuthbase) {
+        cachedAuthbase.parentTxId = tokenId;
       }
 
       return group.map((member, index) => ({
@@ -812,7 +1017,7 @@ export async function getBCMRRegistries(options?: {
     }
 
     // Display detailed cache statistics
-    if (useCache) {
+    if (useCache && backend !== null) {
       const totalHits = perfectCacheHits + goodCacheHits + partialCacheHits;
       const totalResolved = totalHits + cacheMisses;
       const hitPercent = totalResolved > 0 ? ((totalHits / totalResolved) * 100).toFixed(1) : '0.0';
@@ -825,21 +1030,23 @@ export async function getBCMRRegistries(options?: {
       console.log(`  Total: ${totalHits}/${totalResolved} cached (${hitPercent}%)`);
     }
 
-    const tokenIdQueries = groups.size - resolutionErrors;
-    const totalFulcrumQueries = fulcrumSpendQueries + tokenIdQueries;
-    console.log('\nFulcrum Query Statistics:');
-    console.log(`  Spend lookups: ${totalLookups} (${fulcrumSpendQueries} queries after memoisation)`);
-    console.log(`  Token ID lookups: ${tokenIdQueries} (one per identity)`);
-    console.log(`  Total queries: ${totalFulcrumQueries}`);
-    console.log(`  Average per announcement: ${validOutputs.length > 0 ? (totalFulcrumQueries / validOutputs.length).toFixed(2) : '0.00'}`);
-    if (!options?.backend) {
-      const now = getFulcrumStats();
-      console.log(`  Electrum RPC calls: ${now.rpcCalls - fulcrumStatsAtStart.rpcCalls}`);
-      const timeouts = now.timeouts - fulcrumStatsAtStart.timeouts;
-      const dropped = now.droppedRequests - fulcrumStatsAtStart.droppedRequests;
-      const lost = now.connectionsLost - fulcrumStatsAtStart.connectionsLost;
-      if (timeouts || dropped || lost) {
-        console.warn(`  Fulcrum problems: ${timeouts} timeouts, ${dropped} dropped requests, ${lost} connections lost`);
+    if (backend === null) {
+      console.log(`\nSnapshot Statistics:`);
+      console.log(`  Announcements answered by the embedded snapshot: ${snapshotHits}`);
+      console.log(`  Announcements without snapshot data: ${resolutionErrors}`);
+      console.log('  No blockchain queries were made; results are as fresh as the result file');
+    } else {
+      const totalQueries = spendQueries + parentLookups;
+      console.log('\nBackend Query Statistics:');
+      console.log(`  Spend lookups: ${totalLookups} (${spendQueries} queries after memoisation)`);
+      console.log(`  Token ID lookups: ${parentLookups} (identities not covered by snapshot or cache)`);
+      if (escalations > 0) {
+        console.log(`  Long walks finished server-side: ${escalations}`);
+      }
+      console.log(`  Total queries: ${totalQueries}`);
+      console.log(`  Average per announcement: ${validOutputs.length > 0 ? (totalQueries / validOutputs.length).toFixed(2) : '0.00'}`);
+      for (const [label, value] of Object.entries(backend.getStats?.() ?? {})) {
+        console.log(`  ${label}: ${value}`);
       }
     }
 

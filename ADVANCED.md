@@ -6,6 +6,7 @@ This document provides detailed technical information about the BCMR Registry To
 
 - [Project Structure](#project-structure)
 - [Working with Chaingraph Data](#working-with-chaingraph-data)
+- [Resolution Sources](#resolution-sources)
 - [Caching](#caching)
 - [IPFS Gateway Rewriting](#ipfs-gateway-rewriting)
 - [Command Reference](#command-reference)
@@ -72,6 +73,25 @@ bch-ipfs-scrape --query-chaingraph --chaingraph-result-file ./data/results.json
 - Adjust query parameters for different block ranges
 - Experiment with alternative data sources
 
+### Result Size and Paging
+
+Chaingraph's Hasura layer returns at most 5000 rows per request, silently. The default query therefore fetches BCMR outputs in pages of 1000, ordered by transaction hash and output index, until a short page comes back; the log shows the running count. A custom query file is sent as-is in a single request, so add `limit`/`offset` (and an `order_by`) to it yourself if the result can exceed 5000 rows.
+
+### Embedded Resolution
+
+By default `--query-chaingraph` makes a second pass after fetching the BCMR outputs: for every announcement transaction it asks Chaingraph for the resolved authchain (`transaction.authchains`: authhead, chain length, whether the authhead is unspent) and for the outpoint spent by input 0 (the token category), and stores them on the row's `transaction` object. The file also gets a `meta` block:
+
+```json
+{
+  "meta": { "generatedAt": "2026-10-08T12:00:00.000Z", "embeddedResolution": true },
+  "data": { "search_output_prefix": [ ... ] }
+}
+```
+
+The pass has two phases. First, cheap batched queries fetch the spend status of output 0 and the input-0 outpoint for every announcement; an announcement whose output 0 is unspent is its own authhead (chain length 1) and needs nothing more. Only announcements whose output 0 is spent go to Chaingraph's recursive `authchains` query, in batches of 50. Identities whose auth UTXO was swept into busy wallet traffic have chains of hundreds of hops, and those batches can take tens of seconds, so a batch that fails or times out is split in half down to single transactions; a transaction Chaingraph still cannot resolve is skipped with a warning and left without embedded data (a live run resolves it later). A full run over a few thousand announcements takes several minutes. Pass `--no-embed-resolution` to skip the pass. A custom query file still gets the embedding pass as long as its rows have a `transaction_hash`.
+
+A result file with embedded resolution is self-sufficient: anyone can run `--authchain-resolve` on it without Chaingraph or Fulcrum (see [Resolution Sources](#resolution-sources)).
+
 ### Reusing Chaingraph Results
 
 Chaingraph results are saved to disk (default: `chaingraph-result.json`). You can reprocess the same data without re-querying Chaingraph:
@@ -121,6 +141,42 @@ bch-ipfs-scrape \
   --authchain-resolve \
   --fetch-json
 ```
+
+## Resolution Sources
+
+`--authchain-resolve` needs two answers per identity: which transaction currently holds the authhead (found by following output 0 from the announcement) and which output input 0 of the authbase spends (the token category). They can come from three places.
+
+| `--resolve-via` | Source | Network | Freshness |
+|---|---|---|---|
+| `file` | Snapshot embedded in the Chaingraph result file | None | As of the file's `meta.generatedAt` |
+| `chaingraph` | Live Chaingraph (`CHAINGRAPH_URL`) | One batched GraphQL request per hop level; long chains resolved server-side | Live |
+| `fulcrum` | Live Fulcrum (`FULCRUM_WS_URL`) | Electrum RPC per hop (see [Fulcrum Client](#fulcrum-client)) | Live |
+| `auto` (default) | Chaingraph if `CHAINGRAPH_URL` is set, with Fulcrum as fallback if `FULCRUM_WS_URL` is also set; else Fulcrum; else the snapshot | | |
+
+**Snapshot as a seed.** When a live source is used and the file carries embedded resolution, the snapshot seeds the authchain cache: every announcement starts from its snapshot authhead, so an identity whose head did not move costs one "still unspent?" lookup instead of a walk, and the token category needs no lookup at all. Pass `--ignore-embedded` to walk every chain from scratch.
+
+**Live Chaingraph.** Walks are driven by output-0 spend lookups batched across all in-flight chains (`output(where: {transaction_hash: {_in: [...]}, output_index: {_eq: "0"}}) { spent_by { transaction { hash } } }`), so each hop level is one request regardless of how busy the addresses are. After 25 hops in one run the remainder of the chain is handed to Chaingraph's server-side `transaction.authchains`, which is exact but expensive, so it is only paid for the few swept chains. Token categories come from `transaction.inputs`. When Fulcrum is also configured, any lookup Chaingraph fails is retried on Fulcrum and counted in the summary.
+
+**Snapshot only.** With no live source every announcement is answered from its embedded data. The summary states that no blockchain queries were made and when the file was generated. Announcements without embedded data are reported as unresolved. The cache is written as usual, so a later run with a live source verifies instead of walking.
+
+**Errors.** A lookup the source cannot answer (unknown transaction, timeout, HTTP or GraphQL error) aborts that announcement's walk; it is reported as unresolved, not cached, and retried on the next run. Chaingraph requests time out after `CHAINGRAPH_TIMEOUT_MS` (default 120000).
+
+**Measured on the 200-announcement test fixture** (149 identities, including chains of 600 and 1127 hops), no cache, LAN endpoints:
+
+| Source | Requests | Time | Unresolved |
+|---|---|---|---|
+| Fulcrum | 669,006 Electrum RPC calls | 114 s | 1 (chain over the 1000-hop cap) |
+| Chaingraph | 123 GraphQL requests (41 chains finished server-side) | 2.7 s | 0 |
+| Snapshot | 0 | under 1 s | 0 |
+
+**Measured on the full chain** (5871 announcements, 3897 identities, longest chain 4770 hops), LAN endpoints:
+
+| Step | Requests | Time |
+|---|---|---|
+| `--query-chaingraph` with embedding (producer, once per publish) | 6 pages + 60 spend/parent batches + 3263 server-side resolutions in batches of 50 | 11 min |
+| `--authchain-resolve` from the snapshot only | 0 | 0.2 s |
+| `--authchain-resolve --resolve-via fulcrum` (snapshot seeds, Fulcrum verifies) | 5985 Electrum RPC calls | 1.5 s |
+| `--authchain-resolve` with Chaingraph (snapshot seeds, Chaingraph verifies) | 119 GraphQL requests | 0.8 s |
 
 ## Caching
 
@@ -176,6 +232,7 @@ Each cache entry (one per announcement transaction) stores:
 - Chain length (number of transactions from the announcement to the authhead, inclusive)
 - Active status (whether authhead output is unspent)
 - Last checked timestamp
+- Parent transaction ID of the authbase (token category), once known, so later runs skip that lookup
 
 **Cache Updates:**
 - Cache is saved only on successful completion
@@ -238,6 +295,8 @@ Fulcrum 1.9.0 or newer is required for the `include_tokens` filter.
 - A failed spend lookup aborts that announcement's walk. The announcement is reported as unresolved, is not cached, and is excluded from `authhead.json` until a later run resolves it.
 
 **Statistics:** The run summary prints the number of Electrum RPC calls actually sent, and warns when requests timed out, were dropped, or connections were lost.
+
+Fulcrum is one of three resolution sources; see [Resolution Sources](#resolution-sources) for when it is used.
 
 ### IPFS Pin Cache
 
@@ -698,6 +757,9 @@ All entries above normalize to the same source (`ipfs.io`) → destination (`dwe
 | Option | Description | Default | Range/Values |
 |--------|-------------|---------|--------------|
 | `--chaingraph-result-file <path>` | Path to save/load Chaingraph results | `./chaingraph-result.json` | Any valid path |
+| `--no-embed-resolution` | Do not embed authchain resolution when querying Chaingraph | false | Flag (no value) |
+| `--resolve-via <source>` | Where `--authchain-resolve` gets blockchain answers | `auto` | `auto`, `file`, `chaingraph`, `fulcrum` |
+| `--ignore-embedded` | Ignore resolution data embedded in the result file | false | Flag (no value) |
 | `--authhead-file <path>` | Path to authhead.json | `./authhead.json` | Any valid path |
 | `--export-file <filename>` | Export output filename | `exported-urls.txt` | Any filename |
 | `--cids-file <filename>` | BCMR CIDs output filename | `bcmr-ipfs-cids.txt` | Any filename |

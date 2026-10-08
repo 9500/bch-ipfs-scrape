@@ -15,6 +15,7 @@ export interface AuthchainCacheEntry {
   chainLength: number;           // Number of hops in chain
   isActive: boolean;             // Whether authhead output 0 is unspent
   lastCheckedTimestamp: number;  // Unix timestamp of last check
+  parentTxId?: string;           // Txid spent by input 0 (token category); never changes
 }
 
 /**

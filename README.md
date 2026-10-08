@@ -36,6 +36,8 @@ BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain
    # BCMR_WORKDIR=/path/to/data
    # Optional: Fulcrum request timeout in milliseconds (default 30000)
    # FULCRUM_REQUEST_TIMEOUT_MS=30000
+   # Optional: Chaingraph request timeout in milliseconds (default 120000)
+   # CHAINGRAPH_TIMEOUT_MS=120000
    ```
 
 4. **Run the tool:**
@@ -170,7 +172,17 @@ bch-ipfs-scrape --query-chaingraph --authchain-resolve \
 
 ## Using Without Chaingraph or Fulcrum Access
 
-If you don't have access to a Chaingraph or Fulcrum endpoint, you can download a pre-generated Chaingraph result file or already resolved authhead.json. Hosted files and generated on a relatively frequent schedule.
+If you don't have access to a Chaingraph or Fulcrum endpoint, you can download a pre-generated Chaingraph result file or an already resolved authhead.json. Hosted files are generated on a relatively frequent schedule.
+
+The Chaingraph result file produced by `--query-chaingraph` carries, for every BCMR announcement, the resolved authchain (authhead, chain length, whether the authhead is unspent) and the token category. `--authchain-resolve` picks the best available source automatically:
+
+| Available | What `--authchain-resolve` does |
+|---|---|
+| Nothing but the result file | Resolves from the embedded snapshot. No network access; results are as fresh as the file. |
+| `FULCRUM_WS_URL` | Uses the snapshot as a starting point and verifies each authhead with one Fulcrum lookup. |
+| `CHAINGRAPH_URL` | Resolves live against Chaingraph (batched queries, long chains resolved server-side). Fulcrum is used as a fallback if also configured. |
+
+Use `--resolve-via file|chaingraph|fulcrum` to force one source.
 
 ### Download Pre-generated Chaingraph Results to run without Chaingraph access
 
@@ -187,16 +199,19 @@ curl -o chaingraph-result.json https://ipfs.9500.cash/chaingraph-result.json
 2. **Run authchain resolution with the downloaded file:**
 
 ```bash
-# CHAINGRAPH_URL is NOT required when using a pre-saved file
-# Only FULCRUM_WS_URL is needed in your .env file
+# Neither CHAINGRAPH_URL nor FULCRUM_WS_URL is required: the file carries the resolution
 bch-ipfs-scrape --authchain-resolve --fetch-json --export-bcmr-ipfs-cids --export-cashtoken-ipfs-cids --ipfs-pin
+
+# With FULCRUM_WS_URL set, authheads are verified against the blockchain (one lookup each)
+bch-ipfs-scrape --authchain-resolve --resolve-via fulcrum
 ```
 
 **Note:** When using a pre-saved `chaingraph-result.json` file:
 - The `CHAINGRAPH_URL` environment variable is **not required**
-- Only `FULCRUM_WS_URL` is needed for authchain resolution
+- `FULCRUM_WS_URL` is optional: without it the embedded snapshot is used as-is, with it each authhead is re-checked
 - You can skip the `--query-chaingraph` parameter entirely
 - The tool will automatically load data from the existing `chaingraph-result.json` file
+- The summary states when results come from the snapshot and when the file was generated
 
 ### Download Pre-generated authhead.json to run without both Chaingraph or Fulcrum access
 
@@ -389,7 +404,7 @@ When `BCMR_WORKDIR` is not set:
 **For pre-built binary:**
 - Linux (x64 or ARM64)
 - Access to a GraphQL endpoint of a Chaingraph server (optional, required only for the --query-chaingraph command. Can be omitted to run other commands from the saved query result)
-- Access to a Electrum WebSocket endpoint of a Fulcrum server, version 1.9.0 or newer (optional, required only for the --authchain-resolve command. Can be omitted to run other commands from the resolved authhead.json)
+- Access to a Electrum WebSocket endpoint of a Fulcrum server, version 1.9.0 or newer (optional; --authchain-resolve can also run from Chaingraph or from the resolution embedded in a downloaded chaingraph-result.json)
 - IPFS daemon (optional, required only for the `--ipfs-pin` command)
 
 **For building from source:**
