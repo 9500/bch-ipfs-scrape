@@ -12,6 +12,10 @@ Chaingraph GraphQL query responses
 - `empty-result.json` - Empty query response (no registries found)
 - `single-registry.json` - Minimal response with one registry
 
+**Current files:**
+- `sample-100-registries.json`, `sample-200-registries.json` - Real announcements, used by the live integration tests
+- `three-tx-chain.json` - Synthetic authchain `A -> B -> C` (three announcements of one identity, listed out of order), used by `tests/unit/authchain-grouping.test.ts` with a fake backend
+
 **Source:** Shorten your real `chaingraph-result.json` file
 
 ### `bcmr/`

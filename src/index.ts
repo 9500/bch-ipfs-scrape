@@ -911,23 +911,30 @@ async function doAuthchainResolve(options: {
     chaingraphData,
   });
 
-  console.log(`\nFound ${registries.length} total registries`);
+  // Every entry is one BCMR announcement. Announcements of the same identity
+  // share an authhead; only the newest one (isSuperseded === false) is current.
+  const supersededCount = registries.filter((r) => r.isSuperseded).length;
+  const latestPerIdentity = registries.filter((r) => !r.isSuperseded);
+
+  console.log(`\nFound ${registries.length} BCMR announcements for ${latestPerIdentity.length} identities`);
 
   // Filter to current registries: both active (updatable) and burned (finalized)
-  // Exclude superseded registries (replaced by newer authchain updates)
-  const currentRegistries = registries.filter(
+  const currentRegistries = latestPerIdentity.filter(
     (r) => r.isValid && (r.isBurned || r.isAuthheadUnspent)
   );
 
   // Calculate breakdown
   const activeCount = currentRegistries.filter(r => !r.isBurned && r.isAuthheadUnspent).length;
   const burnedCount = currentRegistries.filter(r => r.isBurned).length;
-  const supersededCount = registries.filter(r => r.isValid && !r.isBurned && !r.isAuthheadUnspent).length;
+  const invalidCount = latestPerIdentity.filter(r => !r.isValid).length;
+  const unresolvedCount = latestPerIdentity.filter(r => r.isValid && !r.isBurned && !r.isAuthheadUnspent).length;
 
   console.log(`\nFiltered to ${currentRegistries.length} current registries (active + burned):`);
   console.log(`  Active (updatable): ${activeCount}`);
   console.log(`  Burned (finalized): ${burnedCount}`);
-  console.log(`  Excluded ${supersededCount} superseded registries`);
+  console.log(`  Excluded ${supersededCount} superseded announcements (older versions of an identity)`);
+  console.log(`  Excluded ${invalidCount} invalid (latest announcement has no URIs)`);
+  console.log(`  Excluded ${unresolvedCount} unresolved (authchain walk failed or exceeded maximum length)`);
 
   // Convert to authhead.json format
   const authheadData: AuthheadRegistry[] = currentRegistries.map((r) => ({

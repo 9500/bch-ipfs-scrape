@@ -81,17 +81,23 @@ interface ParsedBCMR {
   uris: string[];
 }
 
-interface BCMRRegistry {
-  authbase: string; // Transaction hash where authchain starts
-  authhead: string; // Latest transaction in authchain
-  tokenId: string;  // Parent transaction ID of authbase (CashToken category ID)
-  blockHeight: number;
+/**
+ * One BCMR announcement, annotated with the identity (authchain) it belongs to.
+ * An identity updated N times yields N entries sharing authbase/authhead/tokenId;
+ * exactly one of them has `isSuperseded === false` and carries the current registry.
+ */
+export interface BCMRRegistry {
+  authbase: string; // Earliest BCMR announcement of this identity (start of the authchain)
+  authhead: string; // Current head of the authchain (transaction holding the unspent output 0)
+  tokenId: string;  // vin[0].txid of the authbase (CashToken category ID when the authbase is the genesis)
+  blockHeight: number; // Block height of this announcement's transaction
   hash: string;
   uris: string[];
   isBurned: boolean;
   isValid: boolean;
-  authchainLength: number; // Number of transactions in the authchain
+  authchainLength: number; // Number of transactions from authbase to authhead (inclusive)
   isAuthheadUnspent: boolean; // True if authhead output 0 is unspent (active registry)
+  isSuperseded: boolean; // True if a later announcement on the same authchain replaces this one
 }
 
 /**
@@ -262,15 +268,34 @@ function isOutputBurned(output: BCMROutput): boolean {
 }
 
 /**
+ * Minimal subset of the Fulcrum client used during authchain resolution.
+ * Injectable so the resolution logic can be unit-tested with a fake backend.
+ */
+export interface AuthchainBackend {
+  /** Return the txid spending `txid:vout`, or null if that output is unspent */
+  getOutputSpendingTx: (txid: string, vout: number) => Promise<string | null>;
+  /** Return a decoded transaction (only `vin[0].txid` is used) */
+  getTransaction: (txid: string) => Promise<{ vin: Array<{ txid?: string }> }>;
+}
+
+const defaultBackend: AuthchainBackend = { getOutputSpendingTx, getTransaction };
+
+/**
  * Get the parent transaction ID of a given transaction
  * Returns the txid of the first input (vin[0].txid)
- * This is the CashToken category ID for genesis transactions
+ *
+ * When `txid` is a CashToken genesis transaction this is the token category ID.
+ * For an authchain *update* transaction it is merely the previous transaction in
+ * the chain, so callers must only use this on the earliest transaction of an
+ * authchain.
+ *
  * @param txid - Transaction hash to get parent of
+ * @param backend - Blockchain backend
  * @returns Parent transaction ID, or null if cannot be determined
  */
-async function getParentTxId(txid: string): Promise<string | null> {
+async function getParentTxId(txid: string, backend: AuthchainBackend): Promise<string | null> {
   try {
-    const tx = await getTransaction(txid);
+    const tx = await backend.getTransaction(txid);
 
     // Return first input's txid (parent transaction)
     if (tx.vin && tx.vin.length > 0 && tx.vin[0].txid) {
@@ -289,37 +314,49 @@ async function getParentTxId(txid: string): Promise<string | null> {
  */
 interface AuthchainResolutionResult {
   entry: AuthchainCacheEntry;
-  queriesUsed: number;
+  /**
+   * Number of output-0 spend lookups performed. Lookups are memoised per run,
+   * so this can exceed the number of real Fulcrum queries.
+   */
+  lookups: number;
   cacheHitType: 'perfect' | 'good' | 'partial' | 'miss';
 }
+
+/**
+ * Looks up the transaction spending output 0 of `txid` (null if unspent)
+ */
+type SpendLookup = (txid: string) => Promise<string | null>;
 
 /**
  * Resolve authchain to find the current authhead
  * Follows the chain of transactions spending output 0 until an unspent output is found
  * Uses cache to avoid redundant queries when possible
  *
- * @param authbaseTxid - Starting transaction hash (authbase)
+ * @param startTxid - Transaction hash to start walking from (a BCMR announcement)
+ * @param lookupSpendingTx - Output-0 spend lookup (memoised by the caller)
  * @param cache - Optional cache to check for existing authchain data
- * @returns Resolution result with cache entry, query count, and hit type
+ * @returns Resolution result with cache entry, lookup count, and hit type
  */
 async function resolveAuthchain(
-  authbaseTxid: string,
+  startTxid: string,
+  lookupSpendingTx: SpendLookup,
   cache?: AuthchainCache
 ): Promise<AuthchainResolutionResult> {
-  const cachedEntry = cache?.entries[authbaseTxid];
+  const cachedEntry = cache?.entries[startTxid];
+  const maxChainLength = 1000;
 
   // OPTIMIZATION 1: Inactive chains never become active again - perfect cache!
   if (cachedEntry && !cachedEntry.isActive) {
     return {
       entry: cachedEntry,
-      queriesUsed: 0,
+      lookups: 0,
       cacheHitType: 'perfect',
     };
   }
 
   // OPTIMIZATION 2: For active chains, check if cached authhead is still unspent
   if (cachedEntry && cachedEntry.isActive) {
-    const spendingTx = await getOutputSpendingTx(cachedEntry.authhead, 0);
+    const spendingTx = await lookupSpendingTx(cachedEntry.authhead);
 
     if (spendingTx === null) {
       // Still unspent - just update timestamp
@@ -328,33 +365,32 @@ async function resolveAuthchain(
           ...cachedEntry,
           lastCheckedTimestamp: Date.now(),
         },
-        queriesUsed: 1,
+        lookups: 1,
         cacheHitType: 'good',
       };
     }
 
-    // Authhead was spent! Continue from here instead of from authbase
+    // Authhead was spent! Continue from here instead of from the start
     let currentTxid = spendingTx;
     let chainLength = cachedEntry.chainLength + 1;
-    const maxChainLength = 1000;
-    let queriesUsed = 1; // Initial check query
+    let lookups = 1; // Initial check
 
     try {
       while (chainLength < maxChainLength) {
-        const nextSpendingTx = await getOutputSpendingTx(currentTxid, 0);
-        queriesUsed++;
+        const nextSpendingTx = await lookupSpendingTx(currentTxid);
+        lookups++;
 
         if (nextSpendingTx === null) {
           // Found new authhead
           return {
             entry: {
-              authbase: authbaseTxid,
+              authbase: startTxid,
               authhead: currentTxid,
               chainLength,
               isActive: true,
               lastCheckedTimestamp: Date.now(),
             },
-            queriesUsed,
+            lookups,
             cacheHitType: 'partial',
           };
         }
@@ -366,53 +402,52 @@ async function resolveAuthchain(
       // Max chain length exceeded
       return {
         entry: {
-          authbase: authbaseTxid,
+          authbase: startTxid,
           authhead: currentTxid,
           chainLength,
           isActive: false,
           lastCheckedTimestamp: Date.now(),
         },
-        queriesUsed,
+        lookups,
         cacheHitType: 'partial',
       };
     } catch (error) {
       // Error during continuation
       return {
         entry: {
-          authbase: authbaseTxid,
+          authbase: startTxid,
           authhead: currentTxid,
           chainLength,
           isActive: false,
           lastCheckedTimestamp: Date.now(),
         },
-        queriesUsed,
+        lookups,
         cacheHitType: 'partial',
       };
     }
   }
 
-  // NO CACHE: Walk entire chain from authbase
-  let currentTxid = authbaseTxid;
+  // NO CACHE: Walk entire chain from the start transaction
+  let currentTxid = startTxid;
   let chainLength = 1;
-  const maxChainLength = 1000;
-  let queriesUsed = 0;
+  let lookups = 0;
 
   try {
     while (chainLength < maxChainLength) {
-      const spendingTxid = await getOutputSpendingTx(currentTxid, 0);
-      queriesUsed++;
+      const spendingTxid = await lookupSpendingTx(currentTxid);
+      lookups++;
 
       if (spendingTxid === null) {
         // Output 0 is unspent - this is the authhead
         return {
           entry: {
-            authbase: authbaseTxid,
+            authbase: startTxid,
             authhead: currentTxid,
             chainLength,
             isActive: true,
             lastCheckedTimestamp: Date.now(),
           },
-          queriesUsed,
+          lookups,
           cacheHitType: 'miss',
         };
       }
@@ -424,38 +459,66 @@ async function resolveAuthchain(
 
     // Hit max chain length
     console.warn(
-      `Warning: Authchain exceeded maximum length of ${maxChainLength} for ${authbaseTxid}`
+      `Warning: Authchain exceeded maximum length of ${maxChainLength} for ${startTxid}`
     );
     return {
       entry: {
-        authbase: authbaseTxid,
+        authbase: startTxid,
         authhead: currentTxid,
         chainLength,
         isActive: false,
         lastCheckedTimestamp: Date.now(),
       },
-      queriesUsed,
+      lookups,
       cacheHitType: 'miss',
     };
   } catch (error) {
     // Return the current position with isActive=false to indicate error
     return {
       entry: {
-        authbase: authbaseTxid,
+        authbase: startTxid,
         authhead: currentTxid,
         chainLength,
         isActive: false,
         lastCheckedTimestamp: Date.now(),
       },
-      queriesUsed,
+      lookups,
       cacheHitType: 'miss',
     };
   }
 }
 
 /**
+ * A single BCMR announcement (one OP_RETURN output) after authchain resolution
+ */
+interface ResolvedAnnouncement {
+  txHash: string;
+  output: BCMROutput;
+  parsed: ParsedBCMR;
+  resolution: AuthchainResolutionResult;
+}
+
+/**
+ * Block height of the announcement transaction (0 if unconfirmed)
+ */
+function announcementHeight(output: BCMROutput): number {
+  const height = output.transaction.block_inclusions[0]?.block.height;
+  return height ? parseInt(String(height)) : 0;
+}
+
+/**
  * Fetch all BCMR registries from Chaingraph
- * Uses authchain caching to avoid redundant Fulcrum queries
+ *
+ * Every BCMR OP_RETURN output returned by Chaingraph is an *announcement*. An
+ * identity that has been updated N times has N announcements, all of which walk
+ * forward (via output 0) to the same unspent authhead. Announcements are therefore
+ * grouped by authhead: the member closest to the head (smallest chain length)
+ * is the identity's current registry and the rest are reported with
+ * `isSuperseded = true`. The token category (tokenId) is derived once per
+ * identity from the earliest announcement, whose input 0 spends the genesis
+ * output in the common case.
+ *
+ * Uses authchain caching and per-run memoisation to avoid redundant Fulcrum queries.
  *
  * @param options - Optional configuration
  * @param options.useCache - Whether to use cache (default: true)
@@ -463,6 +526,7 @@ async function resolveAuthchain(
  * @param options.verbose - Enable verbose logging for detailed diagnostics (default: false)
  * @param options.concurrency - Number of parallel authchain resolutions (default: 50)
  * @param options.chaingraphData - Pre-loaded Chaingraph data (if provided, skips Chaingraph query)
+ * @param options.backend - Blockchain backend (default: Fulcrum client; override for tests)
  */
 export async function getBCMRRegistries(options?: {
   useCache?: boolean;
@@ -470,12 +534,14 @@ export async function getBCMRRegistries(options?: {
   verbose?: boolean;
   concurrency?: number;
   chaingraphData?: { data?: { search_output_prefix?: BCMROutput[] } };
+  backend?: AuthchainBackend;
 }): Promise<BCMRRegistry[]> {
   const useCache = options?.useCache !== false;
   const cachePath = options?.cachePath || './bcmr-registries/.authchain-cache.json';
   const verbose = options?.verbose || false;
   const concurrency = options?.concurrency || 50;
   const chaingraphData = options?.chaingraphData;
+  const backend = options?.backend ?? defaultBackend;
 
   try {
     // Load cache if enabled
@@ -555,25 +621,43 @@ export async function getBCMRRegistries(options?: {
     // Filter to keep only first BCMR output per transaction
     const validOutputs = filterFirstOutputOnly(outputs);
 
-    // Build new cache as we process registries
+    // Memoise output-0 spend lookups for this run. Every announcement of an
+    // identity walks the same tail of the chain to the shared authhead, so
+    // without memoisation that tail is queried once per announcement.
+    const spendMemo = new Map<string, Promise<string | null>>();
+    let fulcrumSpendQueries = 0;
+    const lookupSpendingTx: SpendLookup = (txid) => {
+      let pending = spendMemo.get(txid);
+      if (!pending) {
+        fulcrumSpendQueries++;
+        pending = backend.getOutputSpendingTx(txid, 0).catch((error) => {
+          spendMemo.delete(txid); // Don't memoise failures
+          throw error;
+        });
+        spendMemo.set(txid, pending);
+      }
+      return pending;
+    };
+
+    // Build new cache as we process announcements
     const newCache = createEmptyCache();
-    const registries: BCMRRegistry[] = [];
+    const announcements: ResolvedAnnouncement[] = [];
 
     // Track detailed cache performance
-    let perfectCacheHits = 0;   // Inactive chains (0 queries)
-    let goodCacheHits = 0;      // Active chains still unspent (1 query)
-    let partialCacheHits = 0;   // Active chains continued from cache (N queries)
+    let perfectCacheHits = 0;   // Inactive chains (0 lookups)
+    let goodCacheHits = 0;      // Active chains still unspent (1 lookup)
+    let partialCacheHits = 0;   // Active chains continued from cache (N lookups)
     let cacheMisses = 0;        // No cache entry (full walk)
-    let totalFulcrumQueries = 0;
+    let totalLookups = 0;
     let processedCount = 0;
 
-    console.log(`Resolving authchains for ${validOutputs.length} registries (concurrency: ${concurrency})...`);
+    console.log(`Resolving authchains for ${validOutputs.length} announcements (concurrency: ${concurrency})...`);
     const startTime = Date.now();
 
     /**
-     * Process a single output
+     * Phase 1: resolve the authchain of a single announcement
      */
-    const processOutput = async (output: BCMROutput, index: number): Promise<BCMRRegistry | null> => {
+    const resolveOutput = async (output: BCMROutput): Promise<ResolvedAnnouncement | null> => {
       const parsed = parseBCMRBytecode(output.locking_bytecode);
 
       if (!parsed) {
@@ -583,59 +667,26 @@ export async function getBCMRRegistries(options?: {
       // Strip hex prefix from transaction hash
       const txHash = stripHexPrefix(output.transaction_hash);
 
-      // Get parent transaction ID (CashToken category ID)
-      const parentTxId = await getParentTxId(txHash);
-      if (!parentTxId) {
-        if (verbose) {
-          console.warn(`Warning: Could not resolve parent txid for authbase ${txHash}, skipping registry`);
-        }
-        return null; // Skip this registry
-      }
+      const resolution = await resolveAuthchain(txHash, lookupSpendingTx, oldCache);
 
-      // Resolve authchain with caching
-      const authchainResult = await resolveAuthchain(txHash, oldCache);
-
-      // Get block height (if confirmed) - convert string to number
-      const blockHeight = output.transaction.block_inclusions[0]?.block.height
-        ? parseInt(String(output.transaction.block_inclusions[0].block.height))
-        : 0;
-
-      // Check if output is burned (OP_RETURN at index 0)
-      const isBurned = isOutputBurned(output);
-
-      return {
-        authbase: txHash,
-        authhead: authchainResult.entry.authhead,
-        tokenId: parentTxId,
-        blockHeight,
-        hash: parsed.hash,
-        uris: parsed.uris,
-        isBurned,
-        isValid: parsed.uris.length > 0,
-        authchainLength: authchainResult.entry.chainLength,
-        isAuthheadUnspent: authchainResult.entry.isActive,
-        _authchainResult: authchainResult, // Temp field for statistics
-      } as any;
+      return { txHash, output, parsed, resolution };
     };
 
     /**
-     * Process registries in parallel with concurrency control
+     * Process announcements in parallel with concurrency control
      */
-    const processBatch = async (batch: BCMROutput[], batchStartIndex: number): Promise<void> => {
-      const results = await Promise.all(
-        batch.map((output, i) => processOutput(output, batchStartIndex + i))
-      );
+    const resolveBatch = async (batch: BCMROutput[]): Promise<void> => {
+      const results = await Promise.all(batch.map(resolveOutput));
 
       // Update statistics and cache
       for (const result of results) {
         if (result) {
-          const authchainResult = (result as any)._authchainResult;
-          delete (result as any)._authchainResult;
+          const { resolution } = result;
 
           // Update cache statistics
-          totalFulcrumQueries += authchainResult.queriesUsed;
+          totalLookups += resolution.lookups;
 
-          switch (authchainResult.cacheHitType) {
+          switch (resolution.cacheHitType) {
             case 'perfect':
               perfectCacheHits++;
               break;
@@ -650,68 +701,141 @@ export async function getBCMRRegistries(options?: {
               break;
           }
 
-          // Store in new cache
-          newCache.entries[result.authbase] = authchainResult.entry;
+          // Store in new cache (keyed by announcement tx)
+          newCache.entries[result.txHash] = resolution.entry;
 
-          // Add to registries
-          registries.push(result);
+          announcements.push(result);
 
           // Verbose logging
           if (verbose) {
             const hitTypeDesc: Record<string, string> = {
-              perfect: 'perfect hit (0 queries)',
-              good: `good hit (1 query)`,
-              partial: `partial hit (${authchainResult.queriesUsed} queries)`,
-              miss: `miss (${authchainResult.queriesUsed} queries)`,
+              perfect: 'perfect hit (0 lookups)',
+              good: `good hit (1 lookup)`,
+              partial: `partial hit (${resolution.lookups} lookups)`,
+              miss: `miss (${resolution.lookups} lookups)`,
             };
 
             console.log(
-              `  [${processedCount + 1}/${validOutputs.length}] ${result.tokenId.substring(0, 8)}... ${hitTypeDesc[authchainResult.cacheHitType]}`
+              `  [${processedCount + 1}/${validOutputs.length}] ${result.txHash.substring(0, 8)}... -> authhead ${resolution.entry.authhead.substring(0, 8)}... (length ${resolution.entry.chainLength}) ${hitTypeDesc[resolution.cacheHitType]}`
             );
           }
-
-          processedCount++;
-        } else {
-          processedCount++;
         }
+
+        processedCount++;
       }
 
       // Progress reporting
       if (processedCount % 100 === 0 || processedCount === validOutputs.length) {
-        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        const rate = ((processedCount / (Date.now() - startTime)) * 1000).toFixed(1);
-        console.log(`  Resolving authchains... ${processedCount}/${validOutputs.length} (${elapsed}s, ${rate} reg/s)`);
+        const elapsedMs = Math.max(Date.now() - startTime, 1);
+        const elapsed = (elapsedMs / 1000).toFixed(1);
+        const rate = ((processedCount / elapsedMs) * 1000).toFixed(1);
+        console.log(`  Resolving authchains... ${processedCount}/${validOutputs.length} (${elapsed}s, ${rate} tx/s)`);
       }
     };
 
     // Process in batches with concurrency control
     for (let i = 0; i < validOutputs.length; i += concurrency) {
-      const batch = validOutputs.slice(i, i + concurrency);
-      await processBatch(batch, i);
+      await resolveBatch(validOutputs.slice(i, i + concurrency));
+    }
+
+    // Phase 2: group announcements by authhead (one group per identity)
+    const groups = new Map<string, ResolvedAnnouncement[]>();
+    for (const announcement of announcements) {
+      const authhead = announcement.resolution.entry.authhead;
+      const group = groups.get(authhead);
+      if (group) {
+        group.push(announcement);
+      } else {
+        groups.set(authhead, [announcement]);
+      }
+    }
+
+    console.log(`Grouped ${announcements.length} announcements into ${groups.size} identities`);
+
+    /**
+     * Phase 3: build registry entries for one identity
+     *
+     * Members are ordered by distance to the authhead. The closest member
+     * (smallest chain length) carries the current registry; all others are
+     * superseded. The token category is derived from the farthest member
+     * (the earliest announcement), whose input 0 spends the genesis output
+     * when the first announcement is the genesis transaction.
+     */
+    const buildGroup = async (group: ResolvedAnnouncement[]): Promise<BCMRRegistry[]> => {
+      group.sort(
+        (a, b) =>
+          a.resolution.entry.chainLength - b.resolution.entry.chainLength ||
+          announcementHeight(b.output) - announcementHeight(a.output)
+      );
+
+      const current = group[0];
+      const earliest = group[group.length - 1];
+
+      const tokenId = await getParentTxId(earliest.txHash, backend);
+      if (!tokenId) {
+        if (verbose) {
+          console.warn(`Warning: Could not resolve parent txid for authbase ${earliest.txHash}, skipping identity`);
+        }
+        return []; // Skip this identity
+      }
+
+      return group.map((member, index) => ({
+        authbase: earliest.txHash,
+        authhead: current.resolution.entry.authhead,
+        tokenId,
+        blockHeight: announcementHeight(member.output),
+        hash: member.parsed.hash,
+        uris: member.parsed.uris,
+        isBurned: isOutputBurned(member.output),
+        isValid: member.parsed.uris.length > 0,
+        authchainLength: earliest.resolution.entry.chainLength,
+        isAuthheadUnspent: current.resolution.entry.isActive,
+        isSuperseded: index > 0,
+      }));
+    };
+
+    const registries: BCMRRegistry[] = [];
+    const groupList = Array.from(groups.values());
+    for (let i = 0; i < groupList.length; i += concurrency) {
+      const built = await Promise.all(groupList.slice(i, i + concurrency).map(buildGroup));
+      for (const entries of built) {
+        registries.push(...entries);
+      }
     }
 
     const endTime = Date.now();
     const durationSeconds = ((endTime - startTime) / 1000).toFixed(2);
-    const avgTimePerRegistry = ((endTime - startTime) / validOutputs.length).toFixed(0);
+    const avgTimePerAnnouncement = validOutputs.length > 0
+      ? ((endTime - startTime) / validOutputs.length).toFixed(0)
+      : '0';
+    const supersededCount = registries.filter((r) => r.isSuperseded).length;
 
-    console.log(`Authchain resolution complete in ${durationSeconds}s (avg ${avgTimePerRegistry}ms per registry)`);
+    console.log(`Authchain resolution complete in ${durationSeconds}s (avg ${avgTimePerAnnouncement}ms per announcement)`);
+    console.log(`  ${registries.length - supersededCount} current registries, ${supersededCount} superseded announcements`);
 
     // Display detailed cache statistics
     if (useCache) {
       const totalHits = perfectCacheHits + goodCacheHits + partialCacheHits;
-      const totalRegistries = totalHits + cacheMisses;
+      const totalResolved = totalHits + cacheMisses;
+      const hitPercent = totalResolved > 0 ? ((totalHits / totalResolved) * 100).toFixed(1) : '0.0';
 
       console.log('\nCache Performance:');
-      console.log(`  Perfect hits: ${perfectCacheHits} (0 queries each)`);
-      console.log(`  Good hits: ${goodCacheHits} (1 query each)`);
+      console.log(`  Perfect hits: ${perfectCacheHits} (0 lookups each)`);
+      console.log(`  Good hits: ${goodCacheHits} (1 lookup each)`);
       console.log(`  Partial hits: ${partialCacheHits} (continued from cache)`);
       console.log(`  Misses: ${cacheMisses} (full authchain walk)`);
-      console.log(`  Total: ${totalHits}/${totalRegistries} cached (${((totalHits / totalRegistries) * 100).toFixed(1)}%)`);
+      console.log(`  Total: ${totalHits}/${totalResolved} cached (${hitPercent}%)`);
+    }
 
-      console.log('\nFulcrum Query Statistics:');
-      console.log(`  Total queries: ${totalFulcrumQueries}`);
-      console.log(`  Average per registry: ${(totalFulcrumQueries / validOutputs.length).toFixed(2)}`);
+    const tokenIdQueries = groups.size;
+    const totalFulcrumQueries = fulcrumSpendQueries + tokenIdQueries;
+    console.log('\nFulcrum Query Statistics:');
+    console.log(`  Spend lookups: ${totalLookups} (${fulcrumSpendQueries} queries after memoisation)`);
+    console.log(`  Token ID lookups: ${tokenIdQueries} (one per identity)`);
+    console.log(`  Total queries: ${totalFulcrumQueries}`);
+    console.log(`  Average per announcement: ${validOutputs.length > 0 ? (totalFulcrumQueries / validOutputs.length).toFixed(2) : '0.00'}`);
 
+    if (useCache) {
       // Save cache (atomic - only if we got here successfully)
       saveAuthchainCache(newCache, cachePath);
       console.log(`\nCache saved to ${cachePath}`);

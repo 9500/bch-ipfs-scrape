@@ -1,0 +1,57 @@
+{
+  "data": {
+    "search_output_prefix": [
+      {
+        "locking_bytecode": "\\x6a0442434d5220222222222222222222222222222222222222222222222222222222222222222213697066733a2f2f6261667976657273696f6e321b68747470733a2f2f6578616d706c652e636f6d2f76322e6a736f6e",
+        "output_index": "1",
+        "transaction_hash": "\\xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "value_satoshis": "0",
+        "transaction": {
+          "block_inclusions": [
+            {
+              "block": {
+                "hash": "\\x00000000000000000000000000000000000000000000000000000000000c3502",
+                "height": "800002"
+              }
+            }
+          ]
+        },
+        "spent_by": []
+      },
+      {
+        "locking_bytecode": "\\x6a0442434d5220333333333333333333333333333333333333333333333333333333333333333313697066733a2f2f6261667976657273696f6e33",
+        "output_index": "1",
+        "transaction_hash": "\\xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "value_satoshis": "0",
+        "transaction": {
+          "block_inclusions": [
+            {
+              "block": {
+                "hash": "\\x00000000000000000000000000000000000000000000000000000000000c3503",
+                "height": "800003"
+              }
+            }
+          ]
+        },
+        "spent_by": []
+      },
+      {
+        "locking_bytecode": "\\x6a0442434d5220111111111111111111111111111111111111111111111111111111111111111113697066733a2f2f6261667976657273696f6e31",
+        "output_index": "1",
+        "transaction_hash": "\\xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "value_satoshis": "0",
+        "transaction": {
+          "block_inclusions": [
+            {
+              "block": {
+                "hash": "\\x00000000000000000000000000000000000000000000000000000000000c3501",
+                "height": "800001"
+              }
+            }
+          ]
+        },
+        "spent_by": []
+      }
+    ]
+  }
+}

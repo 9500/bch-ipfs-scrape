@@ -147,7 +147,11 @@ Use `--no-cache` to bypass caching behavior.
 
 **How It Works:**
 
-The cache stores the result of walking each authchain (following the chain of OP_RETURN outputs from authbase to authhead). On subsequent runs:
+Every BCMR OP_RETURN output returned by Chaingraph is an *announcement*. An identity that has been updated N times has N announcements, and all of them walk forward (following the transaction that spends output 0) to the same unspent authhead. The tool resolves every announcement, groups them by authhead, and keeps the announcement closest to the head as the identity's current registry (see [Current Registry Criteria](#current-registry-criteria)).
+
+Within a run, output-0 spend lookups are memoised, so the shared tail of an authchain is queried once no matter how many announcements the identity has. The token category (`tokenId`) is looked up once per identity rather than once per announcement.
+
+The cache stores the result of walking the authchain from each announcement transaction to the authhead. On subsequent runs:
 
 1. **Perfect hits** - Inactive chains (authhead spent, chain ended)
    - Never need revalidation
@@ -166,10 +170,10 @@ The cache stores the result of walking each authchain (following the chain of OP
 
 **What Gets Cached:**
 
-Each cache entry stores:
-- Authbase transaction ID
+Each cache entry (one per announcement transaction) stores:
+- Announcement transaction ID (the walk's starting point)
 - Current authhead transaction ID
-- Chain length (number of hops)
+- Chain length (number of transactions from the announcement to the authhead, inclusive)
 - Active status (whether authhead output is unspent)
 - Last checked timestamp
 
@@ -192,17 +196,25 @@ Loaded authchain cache from ./bcmr-registries/.authchain-cache.json
   3124 entries (1543 active, 1581 inactive)
   Cache age: oldest 2.3h, newest 0.1h
 
+Grouped 3124 announcements into 2006 identities
+Authchain resolution complete in 41.20s (avg 13ms per announcement)
+  2006 current registries, 1118 superseded announcements
+
 Cache Performance:
-  Perfect hits: 1581 (0 queries each)
-  Good hits: 1512 (1 query each)
+  Perfect hits: 1581 (0 lookups each)
+  Good hits: 1512 (1 lookup each)
   Partial hits: 28 (continued from cache)
   Misses: 3 (full authchain walk)
   Total: 3121/3124 cached (99.9%)
 
 Fulcrum Query Statistics:
-  Total queries: 1587
-  Average per registry: 0.51
+  Spend lookups: 1587 (1043 queries after memoisation)
+  Token ID lookups: 2006 (one per identity)
+  Total queries: 3049
+  Average per announcement: 0.98
 ```
+
+"Lookups" count the logical spend checks made while walking chains; "queries" count the Fulcrum requests actually sent after memoisation.
 
 ### IPFS Pin Cache
 
@@ -697,7 +709,7 @@ Multiple protocols can be combined with commas: `--export IPFS,HTTPS`
 
 ### authhead.json
 
-Array of active registry objects:
+Array of current registry objects, one per identity (authchain):
 
 ```json
 [
@@ -711,7 +723,7 @@ Array of active registry objects:
       "ipfs://Qm...",
       "https://example.com/bcmr.json"
     ],
-    "authchainLength": 2,
+    "authchainLength": 3,
     "isActive": true,
     "isBurned": false,
     "isValid": true
@@ -720,15 +732,15 @@ Array of active registry objects:
 ```
 
 **Fields:**
-- `tokenId` - Token/registry identifier (transaction hash)
-- `authbase` - First transaction in authchain
-- `authhead` - Current (latest) transaction in authchain
-- `blockHeight` - Block height of authbase transaction
-- `hash` - SHA-256 hash of registry content
-- `uris` - Array of registry URIs
-- `authchainLength` - Number of transactions in chain
-- `isActive` - Whether authhead is unspent
-- `isBurned` - Whether registry was burned
+- `tokenId` - CashToken category ID: the transaction spent by input 0 of the `authbase`. This is the category when the first announcement is the token's genesis transaction (the common case). It is derived once per identity, never from an update transaction.
+- `authbase` - Earliest BCMR announcement transaction of this identity (start of the authchain)
+- `authhead` - Current head of the authchain: the transaction whose output 0 is unspent. It can be a transaction without a BCMR output if the authhead was moved without a new announcement.
+- `blockHeight` - Block height of the transaction carrying the current announcement (the one whose `hash` and `uris` are listed)
+- `hash` - SHA-256 hash of registry content, from the current announcement
+- `uris` - Array of registry URIs, from the current announcement
+- `authchainLength` - Number of transactions from `authbase` to `authhead`, inclusive (1 for an identity that was never updated)
+- `isActive` - Whether authhead output 0 is unspent
+- `isBurned` - Whether registry was burned (OP_RETURN at output 0, so it can never be updated)
 - `isValid` - Whether registry has valid URIs
 
 ### exported-urls.txt
@@ -764,7 +776,7 @@ Same format as bcmr-ipfs-cids.txt, but extracted from BCMR JSON files instead of
 
 ### BCMR JSON Files
 
-Registry JSON files saved in `--json-folder`, named by token ID:
+Registry JSON files saved in `--json-folder`, named by token ID (one file per identity, since `authhead.json` holds one entry per identity):
 
 ```
 bcmr-registries/
@@ -779,17 +791,30 @@ Each file contains the validated BCMR registry data with hash verification.
 
 ### Current Registry Criteria
 
-`authhead.json` contains only current registries (excludes superseded ones):
+Chaingraph returns every BCMR announcement ever made, including all older versions of identities that were later updated. `authhead.json` contains exactly one entry per identity: its current registry.
+
+**How the current announcement is chosen:**
+
+1. Every announcement transaction is walked forward (following whichever transaction spends output 0) until an unspent output 0 is found. That transaction is the authhead.
+2. Announcements that reach the same authhead belong to the same identity (authchain).
+3. Within an identity, the announcement closest to the authhead (smallest distance to it) is current. All other announcements of that identity are **superseded**.
+4. `authbase` is the earliest announcement of the identity, `authchainLength` is the distance from `authbase` to `authhead`, and `tokenId` is derived from the `authbase`.
+
+For a chain `A -> B -> C` where all three carry BCMR outputs, only C's hash and URIs are written, with `authbase = A`, `authhead = C`, `authchainLength = 3`.
 
 **Included:**
+- ✅ Current announcement of its identity (not superseded)
 - ✅ Valid (`isValid === true`, has URIs and proper format)
 - ✅ Either active OR burned:
-  - **Active** (`!isBurned && isAuthheadUnspent`): Can still be updated via authchain
+  - **Active** (`!isBurned && isActive`): Can still be updated via authchain
   - **Burned** (`isBurned`): Finalized/immutable, cannot be updated
 
 **Excluded:**
-- ❌ **Superseded** (`!isBurned && !isAuthheadUnspent`): Replaced by newer authchain update
-- ❌ **Invalid** (`!isValid`): Malformed or no URIs
+- ❌ **Superseded**: An older announcement of an identity that has a newer one on the same authchain
+- ❌ **Invalid** (`!isValid`): The identity's current announcement is malformed or has no URIs
+- ❌ **Unresolved** (`!isBurned && !isActive`): The authchain walk failed or exceeded the maximum length (1000), so the authhead is unknown
+
+The `--authchain-resolve` output reports each of these counts.
 
 ### URL Protocol Filtering
 
