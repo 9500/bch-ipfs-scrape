@@ -155,10 +155,3 @@ export function configureSchemaValidator(next: ValidatorOptions): void {
   options = next;
   validatorPromise = null;
 }
-
-/**
- * Clear cached validator (useful for testing or if schema updates)
- */
-export function clearSchemaCache(): void {
-  validatorPromise = null;
-}

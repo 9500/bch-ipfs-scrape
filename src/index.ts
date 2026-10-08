@@ -9,6 +9,7 @@ import { getBCMRRegistries, fetchAndValidateRegistry, isValidUrlCharacters, choo
 import { embedResolution, fetchBCMROutputs } from './lib/chaingraph-client.js';
 import { normalizeGatewayDomain, loadGatewayMapping } from './lib/gateway-config.js';
 import { writeFileAtomic } from './lib/atomic-write.js';
+import { loadValidationCache, saveValidationCache, getCacheStats as getValidationCacheStats, type ValidationCache } from './lib/validation-cache.js';
 import { closeConnectionPool } from './lib/fulcrum-client.js';
 import * as dotenv from 'dotenv';
 import { join } from 'path';
@@ -1487,13 +1488,12 @@ async function doFetchJson(options: {
   }
 
   // Load validation cache if schema validation is enabled
-  let validationCache: any = null;
+  let validationCache: ValidationCache | null = null;
   const validationCachePath = join(jsonFolder, '.validation-cache.json');
 
   if (validateSchema) {
-    const { loadValidationCache, createEmptyCache, getCacheStats } = await import('./lib/validation-cache.js');
     validationCache = loadValidationCache(validationCachePath);
-    const stats = getCacheStats(validationCache);
+    const stats = getValidationCacheStats(validationCache);
 
     if (stats.totalEntries > 0) {
       console.log(`Loaded validation cache: ${stats.invalidEntries} known-invalid entries`);
@@ -1663,7 +1663,6 @@ async function doFetchJson(options: {
 
   // Save validation cache if schema validation was enabled
   if (validateSchema && validationCache) {
-    const { saveValidationCache } = await import('./lib/validation-cache.js');
     saveValidationCache(validationCache, validationCachePath);
     console.log(`\nValidation cache saved to ${validationCachePath}`);
   }

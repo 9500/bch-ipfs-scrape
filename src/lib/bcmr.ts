@@ -4,7 +4,7 @@
  */
 
 import { getOutputSpendingTx, getTransaction, getFulcrumStats } from './fulcrum-client.js';
-import { createChaingraphBackend, chainResolutionFromRow, fetchBCMROutputs, fromBytea, type AuthchainRow } from './chaingraph-client.js';
+import { createChaingraphBackend, chainResolutionFromRow, fromBytea, type AuthchainRow } from './chaingraph-client.js';
 import { createHash } from 'crypto';
 import type { AuthchainCache, AuthchainCacheEntry } from './authchain-cache.js';
 import {
@@ -237,11 +237,16 @@ function filterFirstOutputOnly(outputs: BCMROutput[]): BCMROutput[] {
 }
 
 /**
- * Check if an output is burned (is OP_RETURN at output index 0)
+ * Check if an announcement burns its identity.
+ *
+ * The authchain continues through output 0. When the BCMR OP_RETURN itself
+ * sits at output 0, that output is provably unspendable, so the chain can
+ * never be extended: this transaction is the final authhead and the registry
+ * it announces is immutable. `output` is always a BCMR OP_RETURN output
+ * (Chaingraph matched it by its locking bytecode prefix), so its index alone
+ * decides.
  */
 function isOutputBurned(output: BCMROutput): boolean {
-  // An identity is burned if the authhead transaction's output 0 is OP_RETURN
-  // For simplicity, we check if this output is at index 0 and is OP_RETURN
   const outputIndex = parseInt(String(output.output_index));
   return outputIndex === 0;
 }
@@ -616,35 +621,36 @@ function announcementHeight(output: BCMROutput): number {
  *
  * Uses authchain caching and per-run memoisation to avoid redundant Fulcrum queries.
  *
- * @param options - Optional configuration
+ * @param options - Configuration
+ * @param options.chaingraphData - Chaingraph result to resolve (required)
  * @param options.useCache - Whether to use cache (default: true)
  * @param options.cachePath - Path to cache file (default: ./bcmr-registries/.authchain-cache.json)
  * @param options.verbose - Enable verbose logging for detailed diagnostics (default: false)
  * @param options.concurrency - Number of parallel authchain resolutions (default: 50)
- * @param options.chaingraphData - Pre-loaded Chaingraph data (if provided, skips Chaingraph query)
  * @param options.backend - Resolution backend (default: Fulcrum). `null` resolves from the
  *   snapshot embedded in the Chaingraph data only, without any network access.
  * @param options.useSnapshot - Seed resolution from embedded snapshot data when present (default: true)
  * @param options.escalateAfterHops - Hops walked before a whole-chain resolver takes over (default: 25)
  */
-export async function getBCMRRegistries(options?: {
+export async function getBCMRRegistries(options: {
+  /** Chaingraph result (from --query-chaingraph or a downloaded file) */
+  chaingraphData: ChaingraphResultData;
   useCache?: boolean;
   cachePath?: string;
   verbose?: boolean;
   concurrency?: number;
-  chaingraphData?: ChaingraphResultData;
   backend?: AuthchainBackend | null;
   useSnapshot?: boolean;
   escalateAfterHops?: number;
 }): Promise<BCMRRegistry[]> {
-  const useCache = options?.useCache !== false;
-  const cachePath = options?.cachePath || './bcmr-registries/.authchain-cache.json';
-  const verbose = options?.verbose || false;
-  const concurrency = options?.concurrency || 50;
-  const chaingraphData = options?.chaingraphData;
-  const backend: AuthchainBackend | null = options?.backend === undefined ? createFulcrumBackend() : options.backend;
-  const useSnapshot = options?.useSnapshot !== false;
-  const escalateAfterHops = options?.escalateAfterHops ?? DEFAULT_ESCALATE_AFTER_HOPS;
+  const useCache = options.useCache !== false;
+  const cachePath = options.cachePath || './bcmr-registries/.authchain-cache.json';
+  const verbose = options.verbose || false;
+  const concurrency = options.concurrency || 50;
+  const chaingraphData = options.chaingraphData;
+  const backend: AuthchainBackend | null = options.backend === undefined ? createFulcrumBackend() : options.backend;
+  const useSnapshot = options.useSnapshot !== false;
+  const escalateAfterHops = options.escalateAfterHops ?? DEFAULT_ESCALATE_AFTER_HOPS;
 
   try {
     // Load cache if enabled
@@ -677,19 +683,8 @@ export async function getBCMRRegistries(options?: {
       console.log('Authchain cache disabled (--no-cache)');
     }
 
-    // Use pre-loaded data or fetch from Chaingraph
-    let data: ChaingraphResultData;
-
-    if (chaingraphData) {
-      // Use pre-loaded data
-      console.log('Using pre-loaded Chaingraph data...');
-      data = chaingraphData;
-    } else {
-      // Fetch from Chaingraph (paged; a single request is capped at 5000 rows)
-      const outputsFromChaingraph = await fetchBCMROutputs<BCMROutput>();
-      data = { data: { search_output_prefix: outputsFromChaingraph } };
-    }
-
+    console.log('Using pre-loaded Chaingraph data...');
+    const data = chaingraphData;
     const outputs: BCMROutput[] = data.data?.search_output_prefix || [];
 
     // Filter to keep only first BCMR output per transaction
@@ -1297,13 +1292,6 @@ export function resolveUri(uri: string, config?: GatewayConfig): ResolvedUrl {
  */
 export function normalizeUri(uri: string, config?: GatewayConfig): string {
   return resolveUri(uri, config).url;
-}
-
-/**
- * Legacy alias for backward compatibility
- */
-export function ipfsToGateway(uri: string): string {
-  return normalizeUri(uri);
 }
 
 /**

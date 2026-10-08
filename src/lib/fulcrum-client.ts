@@ -421,18 +421,6 @@ class FulcrumConnectionPool {
   }
 
   /**
-   * Get pool statistics
-   */
-  getStats(): { total: number; available: number; pending: number; queued: number } {
-    return {
-      total: this.connections.length,
-      available: this.availableConnections.length,
-      pending: this.pendingRequests.size,
-      queued: this.requestQueue.length,
-    };
-  }
-
-  /**
    * Close all connections; every outstanding request is rejected
    */
   async close(): Promise<void> {
@@ -534,14 +522,6 @@ export async function getTransaction(txid: string): Promise<TransactionVerbose> 
 }
 
 /**
- * Get transaction as raw hex
- */
-export async function getTransactionHex(txid: string): Promise<string> {
-  const result = await electrumCall('blockchain.transaction.get', [txid, false]);
-  return result as string;
-}
-
-/**
  * Get history for a scripthash (all transactions involving this script)
  * Used to find which transaction spent an output
  */
@@ -636,22 +616,4 @@ export async function getOutputSpendingTx(
   throw new Error(
     `Output ${txid}:${vout} is not unspent, but no spending transaction was found in its script history`
   );
-}
-
-/**
- * Get server information
- */
-export async function getServerInfo(): Promise<{
-  version: string;
-  protocolVersion: string;
-  blockHeight: number;
-}> {
-  const serverVersion = await electrumCall('server.version', ['BCMR Client', '1.4']);
-  const headerSubscription = await electrumCall('blockchain.headers.subscribe');
-
-  return {
-    version: Array.isArray(serverVersion) ? serverVersion[0] : serverVersion,
-    protocolVersion: Array.isArray(serverVersion) ? serverVersion[1] : 'unknown',
-    blockHeight: headerSubscription?.height || 0,
-  };
 }

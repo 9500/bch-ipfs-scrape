@@ -31,6 +31,7 @@ coverage/
 bcmr-registries/
 .authchain-cache.json
 .validation-cache.json
+chaingraph-result.json
 authhead.json
 exported-urls.txt
 bcmr-ipfs-cids.txt
@@ -39,3 +40,6 @@ bcmr-ipfs-links.txt
 all-urls.txt
 https-urls.txt
 *.json.txt
+
+# local AI-assistant tool configuration (per developer)
+opencode.json
