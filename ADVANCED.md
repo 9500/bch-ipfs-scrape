@@ -1001,36 +1001,32 @@ npx vitest run --grep "cache"
 
 #### Environment Requirements
 
-Integration tests require environment variables in `.env`:
+None. The suite runs offline: unit tests use fake backends, and the integration tests start a fake Fulcrum (Electrum over WebSocket, answering from a recorded fixture) and a fake Chaingraph (GraphQL over HTTP) on random local ports, then run the built CLI against them. The fakes can drop sockets, leave requests unanswered and return RPC errors, so the failure paths are covered too. Test files run in parallel.
 
-**FULCRUM_WS_URL** (required for authchain resolution tests):
+One opt-in smoke test exercises the real servers configured in `.env`:
+
 ```bash
-FULCRUM_WS_URL=ws://your-fulcrum-server:50003
+LIVE_TESTS=1 npx vitest run tests/integration/live-smoke.test.ts
 ```
-
-**CHAINGRAPH_URL** (required for Chaingraph query tests):
-```bash
-CHAINGRAPH_URL=http://your-chaingraph-server:8088/v1/graphql
-```
-
-Tests gracefully skip when environment variables are missing.
 
 #### Test Coverage
 
 The test suite includes:
 
-**Integration tests** (`tests/integration/`):
+**Integration tests** (`tests/integration/`, built CLI against local fakes):
 - CLI version display
-- Chaingraph querying with custom GraphQL
-- Authchain resolution via Fulcrum
-- Cache creation, updates, and invalidation
-- Cache flags (`--clear-cache`, `--no-cache`)
+- Chaingraph querying: paging past the 5000-row cap, custom query files, missing endpoint
+- Authchain resolution via Fulcrum: results, determinism, RPC errors, dropped sockets, timeouts
+- Resolution from a result file with embedded data (no endpoints)
+- Cache creation, partial and full hits, version migration, `--clear-cache`, `--no-cache`
+- Live smoke test (opt-in)
 
 **Unit tests** (`tests/unit/`):
-- Gateway URL rewriting and normalization
-- IPFS URI conversion (ipfs:// → https://)
-- Gateway mapping file validation
-- Private IP support for local gateways
+- Fulcrum client against a fake Electrum server (drops, retries, timeouts, pool init, spend fast path)
+- Chaingraph client against a fake GraphQL server (batching, errors, paging, embedding)
+- Authchain grouping, superseded detection, resolution tiers and source selection
+- Gateway URL rewriting and normalization, including plain-HTTP gateways
+- SSRF protection and safe fetching
 
 #### Manual Testing
 

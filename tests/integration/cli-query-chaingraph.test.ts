@@ -1,189 +1,99 @@
-import { test, expect, afterEach } from 'vitest';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import { readFileSync, existsSync, unlinkSync } from 'fs';
-import dotenv from 'dotenv';
+/**
+ * --query-chaingraph against a fake Chaingraph that serves a fixture and
+ * caps requests at 5000 rows like the real server.
+ */
+import { test, expect, describe, beforeAll, afterAll, afterEach } from 'vitest';
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { runCli, fixture, scratchDir, cleanupScratch } from '../helpers/cli.js';
+import { startFakeChaingraph, type FakeChaingraph } from '../helpers/fake-chaingraph.js';
 
-const execFileAsync = promisify(execFile);
+const sampleRows: unknown[] = JSON.parse(readFileSync(fixture('chaingraph/sample-200-registries.json'), 'utf-8')).data.search_output_prefix;
 
-// Get the project root directory
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const projectRoot = join(__dirname, '..', '..');
+// 5871 rows: more than one 5000-row cap and not a multiple of the 1000-row page
+const manyRows: unknown[] = Array.from({ length: 5871 }, (_, i) => ({
+  ...(sampleRows[i % sampleRows.length] as object),
+  transaction_hash: '\\x' + i.toString(16).padStart(64, '0'),
+}));
 
-// Path to the compiled CLI entry point
-const cliPath = join(projectRoot, 'dist', 'index.js');
+let chaingraph: FakeChaingraph;
 
-// Load environment variables
-dotenv.config({ path: join(projectRoot, '.env') });
-
-// Test output file path
-const testOutputFile = join(projectRoot, 'test-chaingraph-result.json');
-
-// Skip test if CHAINGRAPH_URL is not configured
-const shouldSkip = !process.env.CHAINGRAPH_URL;
-
-// Cleanup after each test
-afterEach(() => {
-  if (existsSync(testOutputFile)) {
-    unlinkSync(testOutputFile);
-  }
+beforeAll(async () => {
+  chaingraph = await startFakeChaingraph(manyRows, { maxRows: 5000 });
 });
 
-test(
-  '--query-chaingraph fetches BCMR registries from live Chaingraph',
-  { skip: shouldSkip, timeout: 30000 },
-  async () => {
-    // Execute the CLI with --query-chaingraph
-    const { stdout, stderr } = await execFileAsync(
-      'node',
-      [
-        cliPath,
-        '--query-chaingraph',
-        '--no-embed-resolution', // the embedding pass takes minutes; these tests cover the query itself
-        '--chaingraph-result-file',
-        testOutputFile,
-      ],
-      {
-        env: { ...process.env },
-        cwd: projectRoot,
-      }
+afterAll(async () => {
+  await chaingraph.close();
+});
+
+afterEach(() => {
+  chaingraph.requests.length = 0;
+  cleanupScratch();
+});
+
+describe('--query-chaingraph', () => {
+  test('pages through the default query and saves every row with metadata', async () => {
+    const dir = scratchDir();
+    const out = join(dir, 'chaingraph-result.json');
+
+    const { stdout } = await runCli(['--query-chaingraph', '--no-embed-resolution', '--chaingraph-result-file', out], { cwd: dir, chaingraphUrl: chaingraph.url });
+
+    expect(stdout).toContain('Found 5871 BCMR outputs');
+    expect(stdout).toContain('Skipping resolution embedding');
+    expect(existsSync(out)).toBe(true);
+
+    // Six pages of 1000 (the last one short), each in a stable order
+    const pages = chaingraph.requests.map((r) => r.variables?.offset);
+    expect(pages).toEqual([0, 1000, 2000, 3000, 4000, 5000]);
+    expect(chaingraph.requests[0].query).toContain('order_by');
+
+    const result = JSON.parse(readFileSync(out, 'utf-8'));
+    expect(result.meta.embeddedResolution).toBe(false);
+    expect(typeof result.meta.generatedAt).toBe('string');
+    expect(result.data.search_output_prefix).toHaveLength(5871);
+    expect(new Set(result.data.search_output_prefix.map((r: any) => r.transaction_hash)).size).toBe(5871);
+
+    const first = result.data.search_output_prefix[0];
+    expect(first.transaction_hash).toMatch(/^\\x[0-9a-f]+$/i);
+    expect(typeof first.locking_bytecode).toBe('string');
+    expect(first.output_index).toBeDefined();
+    expect(Array.isArray(first.transaction.block_inclusions)).toBe(true);
+    expect(first).toHaveProperty('spent_by');
+  });
+
+  test('a custom query file is sent as-is (single request, server cap applies)', async () => {
+    const dir = scratchDir();
+    const out = join(dir, 'result.json');
+
+    const { stdout } = await runCli(
+      ['--query-chaingraph', fixture('chaingraph/limit-1000-query.graphql'), '--no-embed-resolution', '--chaingraph-result-file', out],
+      { cwd: dir, chaingraphUrl: chaingraph.url }
     );
 
-    // Verify the command completed successfully
-    expect(stdout).toContain('Found');
-    expect(stdout).toContain('BCMR outputs');
-
-    // Verify the output file was created
-    expect(existsSync(testOutputFile)).toBe(true);
-
-    // Parse the JSON output
-    const resultJson = JSON.parse(readFileSync(testOutputFile, 'utf-8'));
-
-    // Validate top-level structure
-    expect(resultJson).toHaveProperty('data');
-    expect(resultJson.data).toHaveProperty('search_output_prefix');
-    expect(Array.isArray(resultJson.data.search_output_prefix)).toBe(true);
-
-    // Verify no GraphQL errors
-    expect(resultJson.errors).toBeUndefined();
-
-    // Verify we have at least 3000 BCMR registries
-    const registries = resultJson.data.search_output_prefix;
-    expect(registries.length).toBeGreaterThanOrEqual(3000);
-
-    console.log(`  ✓ Found ${registries.length} BCMR registries`);
-  }
-);
-
-test(
-  '--query-chaingraph returns valid registry structure',
-  { skip: shouldSkip, timeout: 30000 },
-  async () => {
-    // Execute the CLI with --query-chaingraph
-    await execFileAsync(
-      'node',
-      [
-        cliPath,
-        '--query-chaingraph',
-        '--no-embed-resolution', // the embedding pass takes minutes; these tests cover the query itself
-        '--chaingraph-result-file',
-        testOutputFile,
-      ],
-      {
-        env: { ...process.env },
-        cwd: projectRoot,
-      }
-    );
-
-    // Parse the JSON output
-    const resultJson = JSON.parse(readFileSync(testOutputFile, 'utf-8'));
-    const registries = resultJson.data.search_output_prefix;
-
-    // Verify at least one registry exists
-    expect(registries.length).toBeGreaterThan(0);
-
-    // Validate the structure of the first registry entry
-    const firstRegistry = registries[0];
-
-    // Required fields (Chaingraph may return numbers as strings)
-    expect(firstRegistry).toHaveProperty('locking_bytecode');
-    expect(typeof firstRegistry.locking_bytecode).toBe('string');
-    expect(firstRegistry.locking_bytecode.length).toBeGreaterThan(0);
-
-    expect(firstRegistry).toHaveProperty('output_index');
-    expect(firstRegistry.output_index).toBeDefined();
-
-    expect(firstRegistry).toHaveProperty('transaction_hash');
-    expect(typeof firstRegistry.transaction_hash).toBe('string');
-    expect(firstRegistry.transaction_hash).toMatch(/^\\x[0-9a-f]+$/i); // hex string with \x prefix
-
-    expect(firstRegistry).toHaveProperty('value_satoshis');
-    expect(firstRegistry.value_satoshis).toBeDefined();
-
-    // Transaction object
-    expect(firstRegistry).toHaveProperty('transaction');
-    expect(typeof firstRegistry.transaction).toBe('object');
-    expect(firstRegistry.transaction).toHaveProperty('block_inclusions');
-    expect(Array.isArray(firstRegistry.transaction.block_inclusions)).toBe(true);
-
-    // Spent_by can be null, empty array, or object
-    expect(firstRegistry).toHaveProperty('spent_by');
-    // If spent_by exists and is an object (not null or empty array), validate its structure
-    if (firstRegistry.spent_by && typeof firstRegistry.spent_by === 'object' && !Array.isArray(firstRegistry.spent_by)) {
-      expect(firstRegistry.spent_by).toHaveProperty('input_index');
-      expect(firstRegistry.spent_by).toHaveProperty('transaction');
-    }
-
-    console.log(`  ✓ Registry structure validated for entry with tx ${firstRegistry.transaction_hash.substring(0, 8)}...`);
-  }
-);
-
-test(
-  '--query-chaingraph with custom query limits results to 1000',
-  { skip: shouldSkip, timeout: 30000 },
-  async () => {
-    const customQueryPath = join(
-      projectRoot,
-      'tests/fixtures/chaingraph/limit-1000-query.graphql'
-    );
-
-    // Execute CLI with custom query file
-    const { stdout } = await execFileAsync(
-      'node',
-      [
-        cliPath,
-        '--query-chaingraph',
-        customQueryPath,
-        '--no-embed-resolution', // the embedding pass takes minutes; these tests cover the query itself
-        '--chaingraph-result-file',
-        testOutputFile,
-      ],
-      {
-        env: { ...process.env },
-        cwd: projectRoot,
-      }
-    );
-
-    // Verify output mentions custom query was loaded
     expect(stdout).toContain('Custom query loaded successfully');
+    expect(chaingraph.requests).toHaveLength(1);
+    expect(chaingraph.requests[0].query).toContain('limit: 1000');
+    const result = JSON.parse(readFileSync(out, 'utf-8'));
+    expect(result.data.search_output_prefix).toHaveLength(1000);
+  });
 
-    // Parse result
-    const resultJson = JSON.parse(readFileSync(testOutputFile, 'utf-8'));
+  test('a saved result can be resolved from its embedded snapshot later', async () => {
+    // The producer and consumer halves meet at the file: write a file with
+    // embedded data by hand (as --query-chaingraph would) and resolve it offline
+    const dir = scratchDir();
+    const out = join(dir, 'chaingraph-result.json');
+    const embedded = JSON.parse(readFileSync(fixture('chaingraph/short-chains-embedded.json'), 'utf-8'));
+    writeFileSync(out, JSON.stringify(embedded));
 
-    // Verify exactly 1000 results (not more, not less)
-    const registries = resultJson.data.search_output_prefix;
-    expect(registries.length).toBe(1000);
+    const { stdout } = await runCli(['--authchain-resolve', '--chaingraph-result-file', out, '--authhead-file', join(dir, 'authhead.json'), '--json-folder', dir], { cwd: dir });
+    expect(stdout).toContain('Resolving from the embedded snapshot only');
+    expect(stdout).toContain('Excluded 0 unresolved');
+  });
 
-    console.log(
-      `  ✓ Custom query correctly limited to ${registries.length} registries`
-    );
-  }
-);
-
-// Show helpful message if tests are skipped
-if (shouldSkip) {
-  console.log('\n⚠️  Chaingraph tests skipped: CHAINGRAPH_URL not set in .env file\n');
-}
+  test('fails clearly when CHAINGRAPH_URL is not set', async () => {
+    const dir = scratchDir();
+    await expect(runCli(['--query-chaingraph', '--chaingraph-result-file', join(dir, 'x.json')], { cwd: dir })).rejects.toMatchObject({
+      stderr: expect.stringContaining('CHAINGRAPH_URL environment variable is not set'),
+    });
+  });
+});

@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from 'vitest';
-import { normalizeGatewayDomain, normalizeGatewayHost, loadGatewayMapping } from '../../src/index.js';
+import { normalizeGatewayDomain, normalizeGatewayHost, loadGatewayMapping } from '../../src/lib/gateway-config.js';
 import { normalizeUri, type GatewayConfig } from '../../src/lib/bcmr.js';
 import { writeFileSync, mkdirSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';

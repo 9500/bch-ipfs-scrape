@@ -1,118 +1,32 @@
 # Test Fixtures
 
-This directory contains sample data files used for testing. These are shortened versions of real-world data to keep tests fast and maintainable.
+Sample data used by the tests. Everything here is real blockchain data, reduced
+to what the tests need, so the suite runs offline and deterministically.
 
-## Directory Structure
+## `chaingraph/`
 
-### `chaingraph/`
-Chaingraph GraphQL query responses
+Chaingraph GraphQL results (the shape `--query-chaingraph` writes).
 
-**Example files to add:**
-- `sample-query-result.json` - Truncated chaingraph-result.json with 2-3 registry entries
-- `empty-result.json` - Empty query response (no registries found)
-- `single-registry.json` - Minimal response with one registry
+- `sample-100-registries.json`, `sample-200-registries.json` - Real announcements. Used as row data by the fake Chaingraph in `tests/integration/cli-query-chaingraph.test.ts`; also an input for manual runs. `sample-200` contains identities whose auth UTXO was swept into busy wallets (chains of hundreds of hops), which take minutes to walk against a live Fulcrum.
+- `short-chains-half.json`, `short-chains-full.json` - Announcements whose authchains are short and whose addresses have short histories, so the whole walk is covered by the recorded Fulcrum fixture below. The half file is a prefix of the full file (the cache tests rely on that).
+- `short-chains-embedded.json` - A result file with Chaingraph's authchain resolution and input-0 outpoints embedded, as `--query-chaingraph` produces them. Resolves with no endpoints at all.
+- `three-tx-chain.json` - Synthetic authchain `A -> B -> C` (three announcements of one identity, listed out of order), used by the unit tests with fake backends.
+- `limit-1000-query.graphql` - A custom query file, used to test that custom queries are sent as-is.
 
-**Current files:**
-- `sample-100-registries.json`, `sample-200-registries.json` - Real announcements, used by the live integration tests
-- `three-tx-chain.json` - Synthetic authchain `A -> B -> C` (three announcements of one identity, listed out of order), used by `tests/unit/authchain-grouping.test.ts` with a fake backend
-- `short-chains-embedded.json` - `short-chains-full.json` with Chaingraph's authchain resolution and input-0 outpoints embedded (as `--query-chaingraph` produces them), used by `tests/integration/cli-resolve-file-only.test.ts` to resolve with no endpoints at all
-- `short-chains-half.json`, `short-chains-full.json` - Subset of `sample-200-registries.json` restricted to identities whose authchains are at most 3 hops long, used by the live integration tests so a full walk takes seconds. The half file is a prefix of the full file. `sample-200-registries.json` itself contains identities whose auth UTXO was swept into busy wallets (chains of hundreds of hops), which take minutes to walk honestly.
+## `fulcrum/`
 
-**Source:** Shorten your real `chaingraph-result.json` file
+- `short-chains.json` - Recorded Fulcrum answers (trimmed verbose transactions, `listunspent` with `include_tokens`, `get_history`) covering every hop of the announcements in `short-chains-{half,full}.json`. Served by `tests/helpers/fake-fulcrum.ts`.
 
-### `bcmr/`
-BCMR registry JSON files for testing validation and parsing
+## Fakes (`tests/helpers/`)
 
-**Positive test cases (valid):**
-- `valid-registry.json` - Properly formatted BCMR file
-- `minimal-registry.json` - Minimal valid BCMR structure
+- `fake-fulcrum.ts` - Electrum protocol over WebSocket, answering from the recorded fixture; can drop sockets, ignore requests or return RPC errors on demand.
+- `fake-chaingraph.ts` - GraphQL over HTTP serving `search_output_prefix` pages with the real server's 5000-row cap.
+- `cli.ts` - Runs the built CLI in a scratch directory with explicit endpoints, so a developer's `.env` never leaks live servers into a test.
 
-**Negative test cases (invalid/malicious):**
-- `invalid-missing-fields.json` - Missing required fields
-- `invalid-bad-schema.json` - Schema validation failures
-- `malicious-prototype-pollution.json` - Contains `__proto__`, `constructor`, `prototype`
-- `malicious-path-traversal.json` - Contains `../../` in token IDs
+## Regenerating
 
-**Source:** Use downloaded files from `bcmr-registries/` directory
-
-### `bytecode/`
-Bitcoin Script OP_RETURN bytecode samples (hex format)
-
-**Example files to add:**
-- `valid-bcmr-opreturn.hex` - Valid BCMR OP_RETURN data (starts with 6a04424d52...)
-- `invalid-opreturn.hex` - Malformed or non-BCMR bytecode
-- `empty.hex` - Empty bytecode
-
-**Source:** Extract from real blockchain transactions
-
-### `cids/`
-IPFS CID samples and URL lists
-
-**Example files to add:**
-- `valid-cids.txt` - List of valid IPFS CIDs (one per line)
-- `mixed-urls.txt` - Various URL formats:
-  - `ipfs://Qm...`
-  - `https://ipfs.io/ipfs/Qm...`
-  - `https://Qm....ipfs.dweb.link`
-- `invalid-cids.txt` - Malformed CIDs for error handling tests
-
-**Source:** Extract from `bcmr-ipfs-cids.txt` or `cashtoken-ipfs-cids.txt`
-
-### `caches/`
-Cache file samples
-
-**Example files to add:**
-- `sample-authchain-cache.json` - Pre-populated authchain cache with 2-3 entries
-- `sample-validation-cache.json` - Pre-populated validation cache
-- `empty-cache.json` - Empty but valid cache structure
-- `corrupted-cache.json` - Malformed JSON for error handling
-
-**Source:** Copy from `.authchain-cache.json` and `.validation-cache.json` in your working directory
-
-## Usage in Tests
-
-### Loading Fixtures
-
-```typescript
-import { readFileSync } from 'fs';
-import { join } from 'path';
-
-const fixturesDir = join(__dirname, '..', 'fixtures');
-
-// Load JSON fixture
-const chaingraphResult = JSON.parse(
-  readFileSync(join(fixturesDir, 'chaingraph/sample-query-result.json'), 'utf-8')
-);
-
-// Load text fixture
-const validCids = readFileSync(
-  join(fixturesDir, 'cids/valid-cids.txt'),
-  'utf-8'
-).split('\n').filter(Boolean);
-
-// Load hex/binary fixture
-const bytecode = readFileSync(
-  join(fixturesDir, 'bytecode/valid-bcmr-opreturn.hex'),
-  'utf-8'
-).trim();
-```
-
-## Best Practices
-
-1. **Keep fixtures small** - Only include the minimum data needed for the test
-2. **Use real data** - Base fixtures on actual production data (shortened)
-3. **Name descriptively** - File names should indicate what they test
-4. **Document edge cases** - Add comments in complex fixtures
-5. **Version control** - Commit all fixtures so tests are reproducible
-6. **Sanitize sensitive data** - Remove any private keys, tokens, or personal info
-
-## Creating Fixtures
-
-When creating fixture files from real data:
-
-1. Take a real output file (e.g., `chaingraph-result.json`)
-2. Copy the file structure
-3. Reduce to 1-3 representative examples
-4. Ensure the structure remains valid
-5. Save to the appropriate fixtures subdirectory
-6. Reference in your test files
+`short-chains-*.json` and `fulcrum/short-chains.json` were produced together by
+walking the announcements of `sample-200-registries.json` against a live
+Fulcrum, keeping those whose every hop has a script history of at most 16
+entries, and recording every answer. The live servers can be exercised with
+`LIVE_TESTS=1 npx vitest run tests/integration/live-smoke.test.ts`.
