@@ -26,11 +26,20 @@ export interface AuthchainCache {
 }
 
 /**
+ * Current cache format version.
+ * Version 2: entries are only written for walks that completed, so an
+ * inactive entry always means "exceeded maximum chain length". Version 1
+ * caches also stored walks aborted by backend errors as inactive entries
+ * with a wrong authhead, so they are discarded.
+ */
+export const CACHE_VERSION = 2;
+
+/**
  * Create an empty cache
  */
 export function createEmptyCache(): AuthchainCache {
   return {
-    version: 1,
+    version: CACHE_VERSION,
     entries: {},
   };
 }
@@ -56,8 +65,10 @@ export function loadAuthchainCache(cachePath: string): AuthchainCache {
     }
 
     // Check for version compatibility
-    if (cache.version !== 1) {
-      console.warn(`Unsupported cache version ${cache.version}, creating new cache`);
+    if (cache.version !== CACHE_VERSION) {
+      console.warn(
+        `Authchain cache version ${cache.version} is not supported (current: ${CACHE_VERSION}); rebuilding the cache`
+      );
       return createEmptyCache();
     }
 

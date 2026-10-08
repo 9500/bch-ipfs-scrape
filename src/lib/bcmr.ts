@@ -3,7 +3,7 @@
  * Fetches and parses BCMR registry announcements from the BCH blockchain
  */
 
-import { getOutputSpendingTx, getTransaction } from './fulcrum-client.js';
+import { getOutputSpendingTx, getTransaction, getFulcrumStats } from './fulcrum-client.js';
 import { createHash } from 'crypto';
 import type { AuthchainCache, AuthchainCacheEntry } from './authchain-cache.js';
 import {
@@ -98,6 +98,7 @@ export interface BCMRRegistry {
   authchainLength: number; // Number of transactions from authbase to authhead (inclusive)
   isAuthheadUnspent: boolean; // True if authhead output 0 is unspent (active registry)
   isSuperseded: boolean; // True if a later announcement on the same authchain replaces this one
+  resolutionError: string | null; // Set when the authchain walk failed; the authhead is then unknown
 }
 
 /**
@@ -291,22 +292,18 @@ const defaultBackend: AuthchainBackend = { getOutputSpendingTx, getTransaction }
  *
  * @param txid - Transaction hash to get parent of
  * @param backend - Blockchain backend
- * @returns Parent transaction ID, or null if cannot be determined
+ * @returns Parent transaction ID, or null if the transaction has no previous output (coinbase)
+ * @throws If the transaction cannot be fetched
  */
 async function getParentTxId(txid: string, backend: AuthchainBackend): Promise<string | null> {
-  try {
-    const tx = await backend.getTransaction(txid);
+  const tx = await backend.getTransaction(txid);
 
-    // Return first input's txid (parent transaction)
-    if (tx.vin && tx.vin.length > 0 && tx.vin[0].txid) {
-      return tx.vin[0].txid;
-    }
-
-    return null;
-  } catch (error) {
-    console.error(`Failed to get parent txid for ${txid}:`, error instanceof Error ? error.message : error);
-    return null;
+  // Return first input's txid (parent transaction); coinbase inputs have none
+  if (tx.vin && tx.vin.length > 0 && tx.vin[0].txid) {
+    return tx.vin[0].txid;
   }
+
+  return null;
 }
 
 /**
@@ -320,6 +317,11 @@ interface AuthchainResolutionResult {
    */
   lookups: number;
   cacheHitType: 'perfect' | 'good' | 'partial' | 'miss';
+  /**
+   * Set when the walk was aborted by a backend error. `entry` then describes
+   * the last position reached, with `isActive = false`, and must not be cached.
+   */
+  error?: string;
 }
 
 /**
@@ -331,6 +333,10 @@ type SpendLookup = (txid: string) => Promise<string | null>;
  * Resolve authchain to find the current authhead
  * Follows the chain of transactions spending output 0 until an unspent output is found
  * Uses cache to avoid redundant queries when possible
+ *
+ * A backend error aborts the walk and is reported in the result instead of
+ * being thrown, so one bad announcement never fails a whole batch. The result
+ * then carries `error`, `isActive = false`, and must not be written to the cache.
  *
  * @param startTxid - Transaction hash to start walking from (a BCMR announcement)
  * @param lookupSpendingTx - Output-0 spend lookup (memoised by the caller)
@@ -345,7 +351,7 @@ async function resolveAuthchain(
   const cachedEntry = cache?.entries[startTxid];
   const maxChainLength = 1000;
 
-  // OPTIMIZATION 1: Inactive chains never become active again - perfect cache!
+  // OPTIMIZATION 1: Inactive chains (exceeded max length) never become active again
   if (cachedEntry && !cachedEntry.isActive) {
     return {
       entry: cachedEntry,
@@ -354,82 +360,19 @@ async function resolveAuthchain(
     };
   }
 
-  // OPTIMIZATION 2: For active chains, check if cached authhead is still unspent
-  if (cachedEntry && cachedEntry.isActive) {
-    const spendingTx = await lookupSpendingTx(cachedEntry.authhead);
-
-    if (spendingTx === null) {
-      // Still unspent - just update timestamp
-      return {
-        entry: {
-          ...cachedEntry,
-          lastCheckedTimestamp: Date.now(),
-        },
-        lookups: 1,
-        cacheHitType: 'good',
-      };
-    }
-
-    // Authhead was spent! Continue from here instead of from the start
-    let currentTxid = spendingTx;
-    let chainLength = cachedEntry.chainLength + 1;
-    let lookups = 1; // Initial check
-
-    try {
-      while (chainLength < maxChainLength) {
-        const nextSpendingTx = await lookupSpendingTx(currentTxid);
-        lookups++;
-
-        if (nextSpendingTx === null) {
-          // Found new authhead
-          return {
-            entry: {
-              authbase: startTxid,
-              authhead: currentTxid,
-              chainLength,
-              isActive: true,
-              lastCheckedTimestamp: Date.now(),
-            },
-            lookups,
-            cacheHitType: 'partial',
-          };
-        }
-
-        currentTxid = nextSpendingTx;
-        chainLength++;
-      }
-
-      // Max chain length exceeded
-      return {
-        entry: {
-          authbase: startTxid,
-          authhead: currentTxid,
-          chainLength,
-          isActive: false,
-          lastCheckedTimestamp: Date.now(),
-        },
-        lookups,
-        cacheHitType: 'partial',
-      };
-    } catch (error) {
-      // Error during continuation
-      return {
-        entry: {
-          authbase: startTxid,
-          authhead: currentTxid,
-          chainLength,
-          isActive: false,
-          lastCheckedTimestamp: Date.now(),
-        },
-        lookups,
-        cacheHitType: 'partial',
-      };
-    }
-  }
-
-  // NO CACHE: Walk entire chain from the start transaction
+  // OPTIMIZATION 2: For cached active chains, continue from the cached authhead.
+  // If it is still unspent this costs a single lookup ('good'); if it was spent
+  // the walk continues from there instead of from the start ('partial').
   let currentTxid = startTxid;
   let chainLength = 1;
+  let cacheHitType: AuthchainResolutionResult['cacheHitType'] = 'miss';
+
+  if (cachedEntry) {
+    currentTxid = cachedEntry.authhead;
+    chainLength = cachedEntry.chainLength;
+    cacheHitType = 'good';
+  }
+
   let lookups = 0;
 
   try {
@@ -448,13 +391,16 @@ async function resolveAuthchain(
             lastCheckedTimestamp: Date.now(),
           },
           lookups,
-          cacheHitType: 'miss',
+          cacheHitType,
         };
       }
 
       // Output 0 is spent, follow the chain
       currentTxid = spendingTxid;
       chainLength++;
+      if (cachedEntry) {
+        cacheHitType = 'partial';
+      }
     }
 
     // Hit max chain length
@@ -470,10 +416,10 @@ async function resolveAuthchain(
         lastCheckedTimestamp: Date.now(),
       },
       lookups,
-      cacheHitType: 'miss',
+      cacheHitType,
     };
   } catch (error) {
-    // Return the current position with isActive=false to indicate error
+    // The authhead is unknown: report the failure, never cache it
     return {
       entry: {
         authbase: startTxid,
@@ -483,7 +429,8 @@ async function resolveAuthchain(
         lastCheckedTimestamp: Date.now(),
       },
       lookups,
-      cacheHitType: 'miss',
+      cacheHitType,
+      error: error instanceof Error ? error.message : String(error),
     };
   }
 }
@@ -650,6 +597,9 @@ export async function getBCMRRegistries(options?: {
     let cacheMisses = 0;        // No cache entry (full walk)
     let totalLookups = 0;
     let processedCount = 0;
+    let resolutionErrors = 0;   // Walks aborted by a backend error (not cached)
+    let tokenIdErrors = 0;      // Identities skipped because the tokenId lookup failed
+    const fulcrumStatsAtStart = getFulcrumStats();
 
     console.log(`Resolving authchains for ${validOutputs.length} announcements (concurrency: ${concurrency})...`);
     const startTime = Date.now();
@@ -701,8 +651,16 @@ export async function getBCMRRegistries(options?: {
               break;
           }
 
-          // Store in new cache (keyed by announcement tx)
-          newCache.entries[result.txHash] = resolution.entry;
+          if (resolution.error) {
+            // An aborted walk has no trustworthy authhead: never cache it
+            resolutionErrors++;
+            if (verbose) {
+              console.warn(`  Warning: authchain walk failed for ${result.txHash}: ${resolution.error}`);
+            }
+          } else {
+            // Store in new cache (keyed by announcement tx)
+            newCache.entries[result.txHash] = resolution.entry;
+          }
 
           announcements.push(result);
 
@@ -738,10 +696,14 @@ export async function getBCMRRegistries(options?: {
       await resolveBatch(validOutputs.slice(i, i + concurrency));
     }
 
-    // Phase 2: group announcements by authhead (one group per identity)
+    // Phase 2: group announcements by authhead (one group per identity).
+    // An announcement whose walk failed has no known authhead; keep it on its
+    // own so it can neither join nor supersede a properly resolved identity.
     const groups = new Map<string, ResolvedAnnouncement[]>();
     for (const announcement of announcements) {
-      const authhead = announcement.resolution.entry.authhead;
+      const authhead = announcement.resolution.error
+        ? `error:${announcement.txHash}`
+        : announcement.resolution.entry.authhead;
       const group = groups.get(authhead);
       if (group) {
         group.push(announcement);
@@ -771,12 +733,41 @@ export async function getBCMRRegistries(options?: {
       const current = group[0];
       const earliest = group[group.length - 1];
 
-      const tokenId = await getParentTxId(earliest.txHash, backend);
+      let tokenId: string | null = '';
+      if (current.resolution.error) {
+        // The authhead is unknown, so the announcement is excluded anyway;
+        // report it as unresolved without spending a lookup on its tokenId.
+        return [
+          {
+            authbase: earliest.txHash,
+            authhead: current.resolution.entry.authhead,
+            tokenId,
+            blockHeight: announcementHeight(current.output),
+            hash: current.parsed.hash,
+            uris: current.parsed.uris,
+            isBurned: isOutputBurned(current.output),
+            isValid: current.parsed.uris.length > 0,
+            authchainLength: earliest.resolution.entry.chainLength,
+            isAuthheadUnspent: false,
+            isSuperseded: false,
+            resolutionError: current.resolution.error,
+          },
+        ];
+      }
+
+      try {
+        tokenId = await getParentTxId(earliest.txHash, backend);
+      } catch (error) {
+        tokenIdErrors++;
+        console.warn(
+          `Warning: tokenId lookup failed for authbase ${earliest.txHash}, skipping identity: ${error instanceof Error ? error.message : error}`
+        );
+        return [];
+      }
       if (!tokenId) {
-        if (verbose) {
-          console.warn(`Warning: Could not resolve parent txid for authbase ${earliest.txHash}, skipping identity`);
-        }
-        return []; // Skip this identity
+        tokenIdErrors++;
+        console.warn(`Warning: authbase ${earliest.txHash} has no parent transaction, skipping identity`);
+        return [];
       }
 
       return group.map((member, index) => ({
@@ -791,6 +782,7 @@ export async function getBCMRRegistries(options?: {
         authchainLength: earliest.resolution.entry.chainLength,
         isAuthheadUnspent: current.resolution.entry.isActive,
         isSuperseded: index > 0,
+        resolutionError: current.resolution.error ?? null,
       }));
     };
 
@@ -812,6 +804,12 @@ export async function getBCMRRegistries(options?: {
 
     console.log(`Authchain resolution complete in ${durationSeconds}s (avg ${avgTimePerAnnouncement}ms per announcement)`);
     console.log(`  ${registries.length - supersededCount} current registries, ${supersededCount} superseded announcements`);
+    if (resolutionErrors > 0) {
+      console.warn(`  ${resolutionErrors} authchain walks failed (authhead unknown, not cached; re-run to retry)`);
+    }
+    if (tokenIdErrors > 0) {
+      console.warn(`  ${tokenIdErrors} identities skipped because the tokenId lookup failed`);
+    }
 
     // Display detailed cache statistics
     if (useCache) {
@@ -827,13 +825,23 @@ export async function getBCMRRegistries(options?: {
       console.log(`  Total: ${totalHits}/${totalResolved} cached (${hitPercent}%)`);
     }
 
-    const tokenIdQueries = groups.size;
+    const tokenIdQueries = groups.size - resolutionErrors;
     const totalFulcrumQueries = fulcrumSpendQueries + tokenIdQueries;
     console.log('\nFulcrum Query Statistics:');
     console.log(`  Spend lookups: ${totalLookups} (${fulcrumSpendQueries} queries after memoisation)`);
     console.log(`  Token ID lookups: ${tokenIdQueries} (one per identity)`);
     console.log(`  Total queries: ${totalFulcrumQueries}`);
     console.log(`  Average per announcement: ${validOutputs.length > 0 ? (totalFulcrumQueries / validOutputs.length).toFixed(2) : '0.00'}`);
+    if (!options?.backend) {
+      const now = getFulcrumStats();
+      console.log(`  Electrum RPC calls: ${now.rpcCalls - fulcrumStatsAtStart.rpcCalls}`);
+      const timeouts = now.timeouts - fulcrumStatsAtStart.timeouts;
+      const dropped = now.droppedRequests - fulcrumStatsAtStart.droppedRequests;
+      const lost = now.connectionsLost - fulcrumStatsAtStart.connectionsLost;
+      if (timeouts || dropped || lost) {
+        console.warn(`  Fulcrum problems: ${timeouts} timeouts, ${dropped} dropped requests, ${lost} connections lost`);
+      }
+    }
 
     if (useCache) {
       // Save cache (atomic - only if we got here successfully)

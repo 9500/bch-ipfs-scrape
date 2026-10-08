@@ -149,11 +149,11 @@ Use `--no-cache` to bypass caching behavior.
 
 Every BCMR OP_RETURN output returned by Chaingraph is an *announcement*. An identity that has been updated N times has N announcements, and all of them walk forward (following the transaction that spends output 0) to the same unspent authhead. The tool resolves every announcement, groups them by authhead, and keeps the announcement closest to the head as the identity's current registry (see [Current Registry Criteria](#current-registry-criteria)).
 
-Within a run, output-0 spend lookups are memoised, so the shared tail of an authchain is queried once no matter how many announcements the identity has. The token category (`tokenId`) is looked up once per identity rather than once per announcement.
+Within a run, output-0 spend lookups are memoised, so the shared tail of an authchain is queried once no matter how many announcements the identity has. The token category (`tokenId`) is looked up once per identity rather than once per announcement. See [Fulcrum Client](#fulcrum-client) for how a single spend lookup is answered.
 
-The cache stores the result of walking the authchain from each announcement transaction to the authhead. On subsequent runs:
+The cache stores the result of walking the authchain from each announcement transaction to the authhead. A walk that was aborted by a Fulcrum error is never cached: its authhead is unknown, the announcement is reported as unresolved, and the next run retries it. On subsequent runs:
 
-1. **Perfect hits** - Inactive chains (authhead spent, chain ended)
+1. **Perfect hits** - Inactive chains (exceeded the maximum chain length of 1000)
    - Never need revalidation
    - Zero blockchain queries required
 
@@ -182,6 +182,10 @@ Each cache entry (one per announcement transaction) stores:
 - Interrupted runs do not corrupt the cache
 - Atomic write ensures data integrity
 
+**Cache Version:**
+
+The cache file carries a `version` field (currently 2). A cache written by an older release is discarded with a warning and rebuilt on the next run. Version 1 caches could contain inactive entries produced by Fulcrum errors rather than by a finished walk, so they are not trusted.
+
 **Verbose Output:**
 
 Run with `--verbose` to see detailed cache information:
@@ -196,25 +200,44 @@ Loaded authchain cache from ./bcmr-registries/.authchain-cache.json
   3124 entries (1543 active, 1581 inactive)
   Cache age: oldest 2.3h, newest 0.1h
 
-Grouped 3124 announcements into 2006 identities
-Authchain resolution complete in 41.20s (avg 13ms per announcement)
-  2006 current registries, 1118 superseded announcements
+Grouped 200 announcements into 149 identities
+Authchain resolution complete in 0.17s (avg 1ms per announcement)
+  148 current registries, 51 superseded announcements
 
 Cache Performance:
-  Perfect hits: 1581 (0 lookups each)
-  Good hits: 1512 (1 lookup each)
-  Partial hits: 28 (continued from cache)
-  Misses: 3 (full authchain walk)
-  Total: 3121/3124 cached (99.9%)
+  Perfect hits: 1 (0 lookups each)
+  Good hits: 199 (1 lookup each)
+  Partial hits: 0 (continued from cache)
+  Misses: 0 (full authchain walk)
+  Total: 200/200 cached (100.0%)
 
 Fulcrum Query Statistics:
-  Spend lookups: 1587 (1043 queries after memoisation)
-  Token ID lookups: 2006 (one per identity)
-  Total queries: 3049
-  Average per announcement: 0.98
+  Spend lookups: 199 (148 queries after memoisation)
+  Token ID lookups: 149 (one per identity)
+  Total queries: 297
+  Average per announcement: 1.49
+  Electrum RPC calls: 427
 ```
 
-"Lookups" count the logical spend checks made while walking chains; "queries" count the Fulcrum requests actually sent after memoisation.
+"Lookups" count the logical spend checks made while walking chains; "queries" count the spend checks actually performed after memoisation; "Electrum RPC calls" counts the requests sent to Fulcrum. A cached run costs about two RPC calls per identity (one transaction fetch and one `listunspent`) plus one per identity for the token ID.
+
+A first run without a cache is far more expensive, because every chain is walked to its end. Auth UTXOs that were swept into an ordinary wallet produce chains hundreds of hops long through busy addresses, and finding each hop's spender means scanning the address history. For the 200-announcement test fixture, a cold run sends about 670,000 RPC calls and takes around two minutes against a LAN Fulcrum; the cached run above takes a fraction of a second.
+
+### Fulcrum Client
+
+**Purpose:** Answers the two questions authchain resolution asks Fulcrum: "which transaction spends output 0 of this transaction?" and "which output does input 0 of this transaction spend?" (for `tokenId`).
+
+**Spend lookup:** A spend lookup first fetches the transaction to learn the script of output 0, then asks `blockchain.scripthash.listunspent` (with the `include_tokens` filter, since authhead outputs often carry CashTokens) whether that outpoint is still unspent. In the common case the answer is yes and the lookup is finished after two requests. Only when the outpoint is gone from the unspent set is the script history walked, fetching later transactions until the one spending the outpoint is found. OP_RETURN outputs are answered without any query, because they can never be spent.
+
+Fulcrum 1.9.0 or newer is required for the `include_tokens` filter.
+
+**Failure semantics:** Every request either returns the server's answer or fails; nothing is silently reported as "unspent".
+- A request in flight on a connection that drops is re-sent once on another connection, then rejected.
+- A request not answered within `FULCRUM_REQUEST_TIMEOUT_MS` (default 30000) is rejected and its connection is replaced.
+- The connection pool is only used once every connection has opened. If any connection fails to open, the ones that did are closed and the next call retries from scratch.
+- A failed spend lookup aborts that announcement's walk. The announcement is reported as unresolved, is not cached, and is excluded from `authhead.json` until a later run resolves it.
+
+**Statistics:** The run summary prints the number of Electrum RPC calls actually sent, and warns when requests timed out, were dropped, or connections were lost.
 
 ### IPFS Pin Cache
 
@@ -812,7 +835,7 @@ For a chain `A -> B -> C` where all three carry BCMR outputs, only C's hash and 
 **Excluded:**
 - ❌ **Superseded**: An older announcement of an identity that has a newer one on the same authchain
 - ❌ **Invalid** (`!isValid`): The identity's current announcement is malformed or has no URIs
-- ❌ **Unresolved** (`!isBurned && !isActive`): The authchain walk failed or exceeded the maximum length (1000), so the authhead is unknown
+- ❌ **Unresolved** (`!isBurned && !isActive`): The authchain walk failed with a Fulcrum error or exceeded the maximum length (1000), so the authhead is unknown. Failed walks are not cached and are retried on the next run.
 
 The `--authchain-resolve` output reports each of these counts.
 
@@ -982,6 +1005,12 @@ bch-ipfs-scrape --authchain-resolve --verbose  # Should show cache hits (reuses 
 - Reduce concurrency: `--concurrency 20`
 - Check Fulcrum server is accessible
 - Verify WebSocket URL in `.env`
+
+**"N announcements could not be resolved because of Fulcrum errors"**
+- The affected announcements were left out of `authhead.json` and not cached; run `--authchain-resolve` again to retry them
+- Run with `--verbose` to see the error for each announcement
+- Slow server: raise `FULCRUM_REQUEST_TIMEOUT_MS` in `.env` or lower `--concurrency`
+- "listunspent" errors: the `include_tokens` filter requires Fulcrum 1.9.0 or newer
 
 ### Verbose Output
 

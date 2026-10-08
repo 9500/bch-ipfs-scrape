@@ -19,15 +19,15 @@ const cliPath = join(projectRoot, 'dist', 'index.js');
 // Load environment variables
 dotenv.config({ path: join(projectRoot, '.env') });
 
-// Test fixtures
-const fixture100 = join(
-  projectRoot,
-  'tests/fixtures/chaingraph/sample-100-registries.json'
-);
-const fixture200 = join(
-  projectRoot,
-  'tests/fixtures/chaingraph/sample-200-registries.json'
-);
+// Test fixtures: real announcements whose authchains are short (<= 3 hops), so a
+// full walk against live Fulcrum takes seconds. The half fixture is a prefix of
+// the full one, which is what the partial-cache-hit scenarios rely on.
+const fixtureHalf = join(projectRoot, 'tests/fixtures/chaingraph/short-chains-half.json');
+const fixtureFull = join(projectRoot, 'tests/fixtures/chaingraph/short-chains-full.json');
+const countAnnouncements = (file: string): number =>
+  JSON.parse(readFileSync(file, 'utf-8')).data.search_output_prefix.length;
+const halfCount = countAnnouncements(fixtureHalf);
+const fullCount = countAnnouncements(fixtureFull);
 
 // Test cache directory and files
 const testCacheDir = join(projectRoot, 'test-cache-workflow');
@@ -49,9 +49,9 @@ test(
   { skip: shouldSkip, timeout: 180000 },
   async () => {
     // ========================================
-    // FIRST RUN: 100 registries, no cache
+    // FIRST RUN: half-fixture registries, no cache
     // ========================================
-    console.log('\n  [Run 1] Processing 100 registries with no cache...');
+    console.log('\n  [Run 1] Processing half-fixture registries with no cache...');
 
     const { stdout: stdout1, stderr: _stderr1 } = await execFileAsync(
       'node',
@@ -59,7 +59,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -84,13 +84,13 @@ test(
     const cache1 = JSON.parse(readFileSync(cacheFile, 'utf-8'));
 
     expect(cache1).toHaveProperty('version');
-    expect(cache1.version).toBe(1);
+    expect(cache1.version).toBe(2);
     expect(cache1).toHaveProperty('entries');
     expect(typeof cache1.entries).toBe('object');
 
     // Verify exactly 100 cache entries
     const cache1Count = Object.keys(cache1.entries).length;
-    expect(cache1Count).toBe(100);
+    expect(cache1Count).toBe(halfCount);
 
     // Validate structure of first cache entry
     const firstAuthbase1 = Object.keys(cache1.entries)[0];
@@ -121,9 +121,9 @@ test(
     console.log(`  ✓ Cache created with ${cache1Count} entries`);
 
     // ========================================
-    // SECOND RUN: 200 registries, cache has 100
+    // SECOND RUN: full-fixture registries, cache has 100
     // ========================================
-    console.log('  [Run 2] Processing 200 registries with 100 cached...');
+    console.log('  [Run 2] Processing full-fixture registries with 100 cached...');
 
     const { stdout: stdout2, stderr: _stderr2 } = await execFileAsync(
       'node',
@@ -131,7 +131,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture200,
+        fixtureFull,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -152,20 +152,20 @@ test(
     // Parse updated cache
     const cache2 = JSON.parse(readFileSync(cacheFile, 'utf-8'));
 
-    // Verify cache now has 200 entries (100 old + 100 new)
+    // Verify cache now has full-fixture entries (half old + half new)
     const cache2Count = Object.keys(cache2.entries).length;
-    expect(cache2Count).toBe(200);
+    expect(cache2Count).toBe(fullCount);
 
-    // Verify authhead file has 200 entries
+    // Verify authhead file has full-fixture entries
     const authhead2 = JSON.parse(readFileSync(authheadFile, 'utf-8'));
     expect(authhead2.length).toBeGreaterThanOrEqual(1);
 
-    console.log(`  ✓ Cache grew from 100 to ${cache2Count} entries (100 new added)`);
+    console.log(`  ✓ Cache grew from ${cache1Count} to ${cache2Count} entries`);
 
     // ========================================
-    // THIRD RUN: 200 registries, cache has all 200
+    // THIRD RUN: full-fixture registries, cache has all 200
     // ========================================
-    console.log('  [Run 3] Processing 200 registries with all 200 cached...');
+    console.log('  [Run 3] Processing full-fixture registries with all 200 cached...');
 
     // Small delay to ensure timestamp differences
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -176,7 +176,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture200,
+        fixtureFull,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -197,9 +197,9 @@ test(
     // Parse cache after third run
     const cache3 = JSON.parse(readFileSync(cacheFile, 'utf-8'));
 
-    // Verify cache still has exactly 200 entries (no duplicates added)
+    // Verify cache still has exactly full-fixture entries (no duplicates added)
     const cache3Count = Object.keys(cache3.entries).length;
-    expect(cache3Count).toBe(200);
+    expect(cache3Count).toBe(fullCount);
 
     // Verify timestamps were updated (cache was used and re-saved)
     const firstAuthbase3 = Object.keys(cache3.entries)[0];

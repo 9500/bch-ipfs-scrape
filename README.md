@@ -34,6 +34,8 @@ BCMR (Bitcoin Cash Metadata Registry) is a specification for publishing on-chain
    FULCRUM_WS_URL=ws://your-fulcrum-server:50003
    # Optional: Set a working directory for all output files
    # BCMR_WORKDIR=/path/to/data
+   # Optional: Fulcrum request timeout in milliseconds (default 30000)
+   # FULCRUM_REQUEST_TIMEOUT_MS=30000
    ```
 
 4. **Run the tool:**
@@ -387,7 +389,7 @@ When `BCMR_WORKDIR` is not set:
 **For pre-built binary:**
 - Linux (x64 or ARM64)
 - Access to a GraphQL endpoint of a Chaingraph server (optional, required only for the --query-chaingraph command. Can be omitted to run other commands from the saved query result)
-- Access to a Electrum WebSocket endpoint of a Fulcrum server (optional, required only for the --authchain-resolve command. Can be omitted to run other commands from the resolved authhead.json)
+- Access to a Electrum WebSocket endpoint of a Fulcrum server, version 1.9.0 or newer (optional, required only for the --authchain-resolve command. Can be omitted to run other commands from the resolved authhead.json)
 - IPFS daemon (optional, required only for the `--ipfs-pin` command)
 
 **For building from source:**

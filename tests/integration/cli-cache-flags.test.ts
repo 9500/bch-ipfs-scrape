@@ -19,15 +19,15 @@ const cliPath = join(projectRoot, 'dist', 'index.js');
 // Load environment variables
 dotenv.config({ path: join(projectRoot, '.env') });
 
-// Test fixtures
-const fixture100 = join(
-  projectRoot,
-  'tests/fixtures/chaingraph/sample-100-registries.json'
-);
-const fixture200 = join(
-  projectRoot,
-  'tests/fixtures/chaingraph/sample-200-registries.json'
-);
+// Test fixtures: real announcements whose authchains are short (<= 3 hops), so a
+// full walk against live Fulcrum takes seconds. The half fixture is a prefix of
+// the full one, which is what the partial-cache-hit scenarios rely on.
+const fixtureHalf = join(projectRoot, 'tests/fixtures/chaingraph/short-chains-half.json');
+const fixtureFull = join(projectRoot, 'tests/fixtures/chaingraph/short-chains-full.json');
+const countAnnouncements = (file: string): number =>
+  JSON.parse(readFileSync(file, 'utf-8')).data.search_output_prefix.length;
+const halfCount = countAnnouncements(fixtureHalf);
+const fullCount = countAnnouncements(fixtureFull);
 
 // Test cache directory and files
 const testCacheDir = join(projectRoot, 'test-cache-flags');
@@ -49,9 +49,9 @@ test(
   { skip: shouldSkip, timeout: 120000 },
   async () => {
     // ========================================
-    // SETUP: Create initial cache with 100 registries
+    // SETUP: Create initial cache with half-fixture registries
     // ========================================
-    console.log('\n  [Setup] Creating initial cache with 100 registries...');
+    console.log('\n  [Setup] Creating initial cache with half-fixture registries...');
 
     await execFileAsync(
       'node',
@@ -59,7 +59,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -77,8 +77,8 @@ test(
     // Verify cache was created
     expect(existsSync(cacheFile)).toBe(true);
     const initialCache = JSON.parse(readFileSync(cacheFile, 'utf-8'));
-    expect(Object.keys(initialCache.entries).length).toBe(100);
-    console.log('  ✓ Initial cache created with 100 entries');
+    expect(Object.keys(initialCache.entries).length).toBe(halfCount);
+    console.log('  ✓ Initial cache created with half-fixture entries');
 
     // ========================================
     // TEST: Run with --clear-cache
@@ -91,7 +91,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -116,9 +116,9 @@ test(
     // Verify new cache was created
     expect(existsSync(cacheFile)).toBe(true);
     const newCache = JSON.parse(readFileSync(cacheFile, 'utf-8'));
-    expect(Object.keys(newCache.entries).length).toBe(100);
+    expect(Object.keys(newCache.entries).length).toBe(halfCount);
 
-    console.log('  ✓ Cache was cleared and recreated with 100 entries');
+    console.log('  ✓ Cache was cleared and recreated with half-fixture entries');
   }
 );
 
@@ -137,7 +137,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -214,7 +214,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -239,7 +239,7 @@ test(
     // Verify new cache was created
     expect(existsSync(cacheFile)).toBe(true);
     const newCache = JSON.parse(readFileSync(cacheFile, 'utf-8'));
-    expect(Object.keys(newCache.entries).length).toBe(100);
+    expect(Object.keys(newCache.entries).length).toBe(halfCount);
 
     console.log('  ✓ No error when clearing non-existent cache, new cache created');
   }
@@ -250,9 +250,9 @@ test(
   { skip: shouldSkip, timeout: 60000 },
   async () => {
     // ========================================
-    // SETUP: Create cache with 100 registries
+    // SETUP: Create cache with half-fixture registries
     // ========================================
-    console.log('\n  [Setup] Creating cache with 100 registries...');
+    console.log('\n  [Setup] Creating cache with half-fixture registries...');
 
     await execFileAsync(
       'node',
@@ -260,7 +260,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -276,12 +276,12 @@ test(
     );
 
     expect(existsSync(cacheFile)).toBe(true);
-    console.log('  ✓ Cache created with 100 entries');
+    console.log('  ✓ Cache created with half-fixture entries');
 
     // ========================================
     // TEST: Run with --no-cache
     // ========================================
-    console.log('  [Test] Running same 100 registries with --no-cache...');
+    console.log('  [Test] Running same half-fixture registries with --no-cache...');
 
     const { stdout, stderr: _stderr } = await execFileAsync(
       'node',
@@ -289,7 +289,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -345,7 +345,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -379,9 +379,9 @@ test(
   { skip: shouldSkip, timeout: 120000 },
   async () => {
     // ========================================
-    // SETUP: Create cache with 100 registries
+    // SETUP: Create cache with half-fixture registries
     // ========================================
-    console.log('\n  [Setup] Creating cache with 100 registries...');
+    console.log('\n  [Setup] Creating cache with half-fixture registries...');
 
     await execFileAsync(
       'node',
@@ -389,7 +389,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -410,16 +410,16 @@ test(
     const originalFirstEntry = Object.keys(originalCache.entries)[0];
     const originalTimestamp = originalCache.entries[originalFirstEntry].lastCheckedTimestamp;
 
-    expect(originalCount).toBe(100);
+    expect(originalCount).toBe(halfCount);
     console.log(`  ✓ Original cache created with ${originalCount} entries`);
 
     // Small delay to ensure timestamp would be different if cache were updated
     await new Promise(resolve => setTimeout(resolve, 100));
 
     // ========================================
-    // TEST: Run with --no-cache and 200 registries
+    // TEST: Run with --no-cache and full-fixture registries
     // ========================================
-    console.log('  [Test] Processing 200 registries with --no-cache...');
+    console.log('  [Test] Processing full-fixture registries with --no-cache...');
 
     const { stdout, stderr: _stderr } = await execFileAsync(
       'node',
@@ -427,7 +427,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture200,
+        fixtureFull,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -455,8 +455,8 @@ test(
     const unchangedCount = Object.keys(unchangedCache.entries).length;
     const unchangedTimestamp = unchangedCache.entries[originalFirstEntry].lastCheckedTimestamp;
 
-    // Should still have 100 entries (not 200)
-    expect(unchangedCount).toBe(100);
+    // Should still have half-fixture entries (not the full count)
+    expect(unchangedCount).toBe(halfCount);
 
     // Timestamp should be unchanged
     expect(unchangedTimestamp).toBe(originalTimestamp);
@@ -470,9 +470,9 @@ test(
   { skip: shouldSkip, timeout: 60000 },
   async () => {
     // ========================================
-    // SETUP: Create cache with 100 registries
+    // SETUP: Create cache with half-fixture registries
     // ========================================
-    console.log('\n  [Setup] Creating cache with 100 registries...');
+    console.log('\n  [Setup] Creating cache with half-fixture registries...');
 
     await execFileAsync(
       'node',
@@ -480,7 +480,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',
@@ -496,7 +496,7 @@ test(
     );
 
     expect(existsSync(cacheFile)).toBe(true);
-    console.log('  ✓ Cache created with 100 entries');
+    console.log('  ✓ Cache created with half-fixture entries');
 
     // ========================================
     // TEST: Run with both --clear-cache and --no-cache
@@ -509,7 +509,7 @@ test(
         cliPath,
         '--authchain-resolve',
         '--chaingraph-result-file',
-        fixture100,
+        fixtureHalf,
         '--json-folder',
         testCacheDir,
         '--authhead-file',

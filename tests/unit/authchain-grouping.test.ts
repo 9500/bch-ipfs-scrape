@@ -1,5 +1,6 @@
-import { test, expect, describe } from 'vitest';
-import { readFileSync } from 'fs';
+import { test, expect, describe, afterEach } from 'vitest';
+import { readFileSync, existsSync, rmSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { getBCMRRegistries, type AuthchainBackend } from '../../src/lib/bcmr.js';
@@ -162,5 +163,81 @@ describe('getBCMRRegistries authchain grouping', () => {
       isSuperseded: false,
     });
     expect([...txCalls].sort()).toEqual([txA, other].sort());
+  });
+});
+
+describe('getBCMRRegistries error handling', () => {
+  let scratchDir: string | null = null;
+
+  afterEach(() => {
+    if (scratchDir && existsSync(scratchDir)) {
+      rmSync(scratchDir, { recursive: true, force: true });
+    }
+    scratchDir = null;
+  });
+
+  test('a backend error mid-walk is reported as unresolved and never cached', async () => {
+    scratchDir = mkdtempSync(join(tmpdir(), 'authchain-cache-'));
+    const cachePath = join(scratchDir, '.authchain-cache.json');
+
+    // A -> B, but the spend lookup for B fails. C is an unrelated healthy identity.
+    const spends: Record<string, string | null> = { [txA]: txB, [txC]: null };
+    const backend: AuthchainBackend = {
+      async getOutputSpendingTx(txid) {
+        if (txid === txB) throw new Error('Fulcrum request timed out');
+        if (!(txid in spends)) throw new Error(`unexpected spend lookup for ${txid}`);
+        return spends[txid];
+      },
+      async getTransaction(txid) {
+        return { vin: [{ txid: txid === txC ? 'cc'.repeat(31) + '01' : categoryId, vout: 0 }] };
+      },
+    };
+
+    const registries = await getBCMRRegistries({
+      useCache: true,
+      cachePath,
+      chaingraphData: loadFixture(),
+      backend,
+    });
+
+    // A's walk reached B and failed there; B's walk failed immediately.
+    const failed = registries.filter((r) => r.resolutionError);
+    expect(failed.map((r) => r.hash).sort()).toEqual(['11'.repeat(32), '22'.repeat(32)]);
+    for (const r of failed) {
+      expect(r.isAuthheadUnspent).toBe(false);
+      expect(r.isSuperseded).toBe(false);
+      expect(r.resolutionError).toMatch(/timed out/);
+    }
+
+    // The failed announcements neither joined nor superseded the healthy identity
+    const healthy = registries.find((r) => r.hash === '33'.repeat(32));
+    expect(healthy).toMatchObject({
+      authbase: txC,
+      authhead: txC,
+      authchainLength: 1,
+      isAuthheadUnspent: true,
+      isSuperseded: false,
+      resolutionError: null,
+    });
+
+    // Only the completed walk was cached
+    const cache = JSON.parse(readFileSync(cachePath, 'utf-8'));
+    expect(cache.version).toBe(2);
+    expect(Object.keys(cache.entries)).toEqual([txC]);
+  });
+
+  test('a failed tokenId lookup skips the identity without aborting the run', async () => {
+    const { backend } = fakeBackend(
+      { [txA]: txB, [txB]: txC, [txC]: null },
+      {} // getTransaction throws for every txid
+    );
+
+    const registries = await getBCMRRegistries({
+      useCache: false,
+      chaingraphData: loadFixture(),
+      backend,
+    });
+
+    expect(registries).toEqual([]);
   });
 });

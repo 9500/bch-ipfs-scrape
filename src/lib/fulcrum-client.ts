@@ -1,6 +1,12 @@
 /**
  * Fulcrum Electrum Protocol Client
  * Connects to Fulcrum server for blockchain queries with connection pooling
+ *
+ * Failure semantics: every request either resolves with the server's result
+ * or rejects. A request in flight on a socket that drops is re-queued once and
+ * then rejected; a request that is not answered within the request timeout is
+ * rejected and its socket is discarded. Nothing hangs and nothing is silently
+ * turned into a fake "success".
  */
 
 import WebSocket from 'ws';
@@ -16,7 +22,7 @@ interface ElectrumResponse {
   };
 }
 
-interface TransactionVerbose {
+export interface TransactionVerbose {
   txid: string;
   hash: string;
   version: number;
@@ -50,12 +56,70 @@ interface HistoryItem {
   fee?: number;
 }
 
+interface UnspentItem {
+  tx_hash: string;
+  tx_pos: number;
+  height: number;
+  value: number;
+}
+
 interface PendingRequest {
+  id: number;
   method: string;
   params: any[];
   resolve: (value: any) => void;
   reject: (error: Error) => void;
-  id: number;
+  /** Socket the request was sent on; null while queued */
+  ws: WebSocket | null;
+  /** Lifetime timer, armed when the request is enqueued */
+  timer: NodeJS.Timeout | null;
+  /** Number of times the request has been sent */
+  attempts: number;
+}
+
+/** Default per-request timeout (ms); override with FULCRUM_REQUEST_TIMEOUT_MS */
+const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+/** Connection open timeout (ms) */
+const CONNECT_TIMEOUT_MS = 10000;
+/** A request dropped by a closing socket is re-sent at most this many times in total */
+const MAX_SEND_ATTEMPTS = 2;
+/** Delay before retrying to refill the pool after a failed reconnect (ms) */
+const RECONNECT_RETRY_MS = 1000;
+/** Largest number of spender candidates fetched in parallel per round */
+const MAX_CANDIDATE_ROUND = 16;
+
+/**
+ * Process-wide client statistics (survive pool re-creation)
+ */
+const stats = {
+  rpcCalls: 0,          // Requests handed to the pool
+  timeouts: 0,          // Requests rejected by the request timeout
+  droppedRequests: 0,   // Requests whose socket closed while they were in flight
+  connectionsLost: 0,   // Sockets that closed while the pool was active
+};
+
+export interface FulcrumStats {
+  rpcCalls: number;
+  timeouts: number;
+  droppedRequests: number;
+  connectionsLost: number;
+}
+
+export function getFulcrumStats(): FulcrumStats {
+  return { ...stats };
+}
+
+export function resetFulcrumStats(): void {
+  stats.rpcCalls = 0;
+  stats.timeouts = 0;
+  stats.droppedRequests = 0;
+  stats.connectionsLost = 0;
+}
+
+export interface FulcrumPoolOptions {
+  poolSize?: number;
+  requestTimeoutMs?: number;
+  wsUrl?: string;
 }
 
 /**
@@ -69,75 +133,155 @@ class FulcrumConnectionPool {
   private nextRequestId = 1;
   private poolSize: number;
   private wsUrl: string;
-  private connectionPromises: Map<WebSocket, Promise<void>> = new Map();
+  private requestTimeoutMs: number;
   private isClosing = false;
+  private refillTimer: NodeJS.Timeout | null = null;
 
-  constructor(poolSize = 10) {
-    const FULCRUM_WS_URL = process.env.FULCRUM_WS_URL;
-    if (!FULCRUM_WS_URL) {
+  constructor(options: FulcrumPoolOptions = {}) {
+    const wsUrl = options.wsUrl ?? process.env.FULCRUM_WS_URL;
+    if (!wsUrl) {
       throw new Error('FULCRUM_WS_URL environment variable is not set');
     }
-    this.wsUrl = FULCRUM_WS_URL;
-    this.poolSize = poolSize;
+    this.wsUrl = wsUrl;
+    this.poolSize = options.poolSize ?? 10;
+
+    const envTimeout = parseInt(process.env.FULCRUM_REQUEST_TIMEOUT_MS || '', 10);
+    this.requestTimeoutMs =
+      options.requestTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : DEFAULT_REQUEST_TIMEOUT_MS);
   }
 
   /**
    * Initialize the connection pool
+   * Either every connection opens, or the pool is closed and an error is thrown.
    */
   async initialize(): Promise<void> {
-    const promises = [];
-    for (let i = 0; i < this.poolSize; i++) {
-      promises.push(this.createConnection());
+    const results = await Promise.allSettled(
+      Array.from({ length: this.poolSize }, () => this.createConnection())
+    );
+
+    const failures = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failures.length > 0) {
+      // Close whatever did open so nothing leaks from a half-built pool
+      await this.close();
+      const reason = failures[0].reason instanceof Error ? failures[0].reason.message : String(failures[0].reason);
+      throw new Error(
+        `Failed to open ${failures.length}/${this.poolSize} Fulcrum connections to ${this.wsUrl}: ${reason}`
+      );
     }
-    await Promise.all(promises);
   }
 
   /**
    * Create a new WebSocket connection
    */
-  private async createConnection(): Promise<void> {
+  private createConnection(): Promise<void> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.wsUrl);
+      let opened = false;
+      let lastError: Error | null = null;
 
-      const timeout = setTimeout(() => {
-        ws.close();
+      const connectTimer = setTimeout(() => {
+        ws.terminate();
         reject(new Error('Fulcrum connection timeout during pool initialization'));
-      }, 10000);
+      }, CONNECT_TIMEOUT_MS);
 
       ws.on('open', () => {
-        clearTimeout(timeout);
+        clearTimeout(connectTimer);
+        opened = true;
+        if (this.isClosing) {
+          ws.terminate();
+          resolve();
+          return;
+        }
         this.connections.push(ws);
         this.availableConnections.push(ws);
         this.setupMessageHandler(ws);
         resolve();
+        // Requests may have queued up while no socket was available
+        this.processQueue();
       });
 
       ws.on('error', (error) => {
-        clearTimeout(timeout);
-        reject(error);
+        clearTimeout(connectTimer);
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (!opened) {
+          reject(lastError);
+        }
+        // After open, 'close' follows and handles in-flight requests
       });
 
       ws.on('close', () => {
-        // Remove from available connections
-        const availableIndex = this.availableConnections.indexOf(ws);
-        if (availableIndex !== -1) {
-          this.availableConnections.splice(availableIndex, 1);
+        clearTimeout(connectTimer);
+        if (!opened) {
+          reject(lastError ?? new Error('Fulcrum connection closed before it opened'));
+          return;
         }
-
-        // Remove from all connections
-        const index = this.connections.indexOf(ws);
-        if (index !== -1) {
-          this.connections.splice(index, 1);
-        }
-
-        // Recreate connection if pool is still active and not closing
-        if (!this.isClosing && this.connections.length < this.poolSize) {
-          this.createConnection().catch((err) => {
-            console.error('Failed to recreate connection:', err);
-          });
-        }
+        this.handleConnectionClosed(ws, lastError);
       });
     });
+  }
+
+  /**
+   * A live socket closed: drop it, deal with its in-flight requests, and refill the pool
+   */
+  private handleConnectionClosed(ws: WebSocket, lastError: Error | null): void {
+    const availableIndex = this.availableConnections.indexOf(ws);
+    if (availableIndex !== -1) {
+      this.availableConnections.splice(availableIndex, 1);
+    }
+    const index = this.connections.indexOf(ws);
+    if (index !== -1) {
+      this.connections.splice(index, 1);
+    }
+
+    if (!this.isClosing) {
+      stats.connectionsLost++;
+    }
+
+    // Requests in flight on this socket will never get a response here.
+    // Re-queue each once; reject if it already had its retry or the pool is closing.
+    for (const [id, request] of this.pendingRequests) {
+      if (request.ws !== ws) continue;
+      this.pendingRequests.delete(id);
+      request.ws = null;
+      stats.droppedRequests++;
+
+      if (!this.isClosing && request.attempts < MAX_SEND_ATTEMPTS) {
+        this.requestQueue.unshift(request);
+      } else {
+        this.settle(
+          request,
+          new Error(
+            `Fulcrum connection closed while ${request.method} was in flight` +
+              (lastError ? ` (${lastError.message})` : '')
+          )
+        );
+      }
+    }
+
+    this.refillPool();
+  }
+
+  /**
+   * Open connections until the pool is full again; retry later on failure
+   */
+  private refillPool(): void {
+    if (this.isClosing) return;
+
+    const missing = this.poolSize - this.connections.length;
+    if (missing <= 0) return;
+
+    for (let i = 0; i < missing; i++) {
+      this.createConnection().catch((err) => {
+        console.error('Failed to recreate Fulcrum connection:', err instanceof Error ? err.message : err);
+        if (!this.isClosing && !this.refillTimer) {
+          this.refillTimer = setTimeout(() => {
+            this.refillTimer = null;
+            this.refillPool();
+          }, RECONNECT_RETRY_MS);
+          this.refillTimer.unref();
+        }
+      });
+    }
   }
 
   /**
@@ -145,45 +289,101 @@ class FulcrumConnectionPool {
    */
   private setupMessageHandler(ws: WebSocket): void {
     ws.on('message', (data: WebSocket.Data) => {
+      let response: ElectrumResponse;
       try {
-        const response: ElectrumResponse = JSON.parse(data.toString());
-        const pending = this.pendingRequests.get(Number(response.id));
-
-        if (pending) {
-          this.pendingRequests.delete(Number(response.id));
-
-          if (response.error) {
-            pending.reject(new Error(`Fulcrum error: ${response.error.message}`));
-          } else {
-            pending.resolve(response.result);
-          }
-
-          // Mark connection as available and process queue
-          if (!this.availableConnections.includes(ws)) {
-            this.availableConnections.push(ws);
-          }
-          this.processQueue();
-        }
+        response = JSON.parse(data.toString());
       } catch (e) {
         console.error('Error parsing Fulcrum response:', e);
+        return;
       }
+
+      const pending = this.pendingRequests.get(Number(response.id));
+      if (!pending) {
+        // Notification or a response to a request that already timed out
+        return;
+      }
+
+      this.pendingRequests.delete(pending.id);
+
+      if (response.error) {
+        this.settle(pending, new Error(`Fulcrum error: ${response.error.message}`));
+      } else {
+        this.settle(pending, null, response.result);
+      }
+
+      // Mark connection as available and process queue
+      if (!this.isClosing && this.connections.includes(ws) && !this.availableConnections.includes(ws)) {
+        this.availableConnections.push(ws);
+      }
+      this.processQueue();
     });
+  }
+
+  /**
+   * Finish a request exactly once and release its timer
+   */
+  private settle(request: PendingRequest, error: Error | null, result?: any): void {
+    if (request.timer) {
+      clearTimeout(request.timer);
+      request.timer = null;
+    }
+    if (error) {
+      request.reject(error);
+    } else {
+      request.resolve(result);
+    }
+  }
+
+  /**
+   * The request's lifetime expired, queued or in flight
+   */
+  private handleTimeout(request: PendingRequest): void {
+    request.timer = null;
+    stats.timeouts++;
+
+    const queueIndex = this.requestQueue.indexOf(request);
+    if (queueIndex !== -1) {
+      this.requestQueue.splice(queueIndex, 1);
+    }
+
+    if (this.pendingRequests.has(request.id)) {
+      this.pendingRequests.delete(request.id);
+      // The socket is stuck or the response is lost; discard it. The 'close'
+      // handler finds no pending request for it and simply refills the pool.
+      if (request.ws) {
+        request.ws.terminate();
+      }
+    }
+
+    this.settle(
+      request,
+      new Error(`Fulcrum request ${request.method} timed out after ${this.requestTimeoutMs}ms`)
+    );
   }
 
   /**
    * Make a call using a pooled connection
    */
-  async call(method: string, params: any[] = []): Promise<any> {
+  call(method: string, params: any[] = []): Promise<any> {
     return new Promise((resolve, reject) => {
-      const id = this.nextRequestId++;
+      if (this.isClosing) {
+        reject(new Error('Fulcrum connection pool is closed'));
+        return;
+      }
+
       const request: PendingRequest = {
+        id: this.nextRequestId++,
         method,
         params,
         resolve,
         reject,
-        id,
+        ws: null,
+        timer: null,
+        attempts: 0,
       };
+      request.timer = setTimeout(() => this.handleTimeout(request), this.requestTimeoutMs);
 
+      stats.rpcCalls++;
       this.requestQueue.push(request);
       this.processQueue();
     });
@@ -197,10 +397,10 @@ class FulcrumConnectionPool {
       const request = this.requestQueue.shift()!;
       const ws = this.availableConnections.shift()!;
 
-      // Add to pending requests
+      request.ws = ws;
+      request.attempts++;
       this.pendingRequests.set(request.id, request);
 
-      // Send request
       const message = {
         jsonrpc: '2.0',
         id: request.id,
@@ -213,7 +413,8 @@ class FulcrumConnectionPool {
       } catch (error) {
         // If send fails, reject and return connection to pool
         this.pendingRequests.delete(request.id);
-        request.reject(error instanceof Error ? error : new Error('Failed to send request'));
+        request.ws = null;
+        this.settle(request, error instanceof Error ? error : new Error('Failed to send request'));
         this.availableConnections.push(ws);
       }
     }
@@ -232,42 +433,76 @@ class FulcrumConnectionPool {
   }
 
   /**
-   * Close all connections
+   * Close all connections; every outstanding request is rejected
    */
   async close(): Promise<void> {
     this.isClosing = true;
 
-    for (const ws of this.connections) {
-      ws.close();
+    if (this.refillTimer) {
+      clearTimeout(this.refillTimer);
+      this.refillTimer = null;
     }
-    this.connections = [];
-    this.availableConnections = [];
+
+    const closedError = new Error('Fulcrum connection pool closed');
+    for (const request of this.pendingRequests.values()) {
+      this.settle(request, closedError);
+    }
+    for (const request of this.requestQueue) {
+      this.settle(request, closedError);
+    }
     this.pendingRequests.clear();
     this.requestQueue = [];
+
+    const sockets = this.connections;
+    this.connections = [];
+    this.availableConnections = [];
+    for (const ws of sockets) {
+      ws.terminate();
+    }
   }
 }
 
 // Global connection pool instance
 let globalPool: FulcrumConnectionPool | null = null;
+// In-progress initialisation shared by concurrent first callers
+let globalPoolInit: Promise<FulcrumConnectionPool> | null = null;
 
 /**
  * Get or create the global connection pool
+ * The pool is only published once every connection is open; a failed
+ * initialisation is discarded so the next call retries from scratch.
  */
 export async function getConnectionPool(poolSize = 10): Promise<FulcrumConnectionPool> {
-  if (!globalPool) {
-    globalPool = new FulcrumConnectionPool(poolSize);
-    await globalPool.initialize();
+  if (globalPool) {
+    return globalPool;
   }
-  return globalPool;
+
+  if (!globalPoolInit) {
+    globalPoolInit = (async () => {
+      const pool = new FulcrumConnectionPool({ poolSize });
+      try {
+        await pool.initialize();
+      } catch (error) {
+        globalPoolInit = null;
+        throw error;
+      }
+      globalPool = pool;
+      return pool;
+    })();
+  }
+
+  return globalPoolInit;
 }
 
 /**
  * Close the global connection pool
  */
 export async function closeConnectionPool(): Promise<void> {
-  if (globalPool) {
-    await globalPool.close();
-    globalPool = null;
+  const pool = globalPool;
+  globalPool = null;
+  globalPoolInit = null;
+  if (pool) {
+    await pool.close();
   }
 }
 
@@ -308,7 +543,7 @@ export async function getTransactionHex(txid: string): Promise<string> {
 
 /**
  * Get history for a scripthash (all transactions involving this script)
- * Used to find if an output has been spent
+ * Used to find which transaction spent an output
  */
 export async function getScripthashHistory(scripthash: string): Promise<HistoryItem[]> {
   const result = await electrumCall('blockchain.scripthash.get_history', [scripthash]);
@@ -316,57 +551,91 @@ export async function getScripthashHistory(scripthash: string): Promise<HistoryI
 }
 
 /**
+ * Get the unspent outputs of a scripthash (confirmed and mempool)
+ *
+ * BCMR authhead outputs frequently carry CashTokens, and Fulcrum excludes
+ * token-bearing UTXOs from `listunspent` unless asked for them, so the
+ * `include_tokens` filter is always requested (Fulcrum >= 1.9.0).
+ */
+export async function getScripthashUnspent(scripthash: string): Promise<UnspentItem[]> {
+  const result = await electrumCall('blockchain.scripthash.listunspent', [scripthash, 'include_tokens']);
+  return result as UnspentItem[];
+}
+
+/**
  * Check if a specific output (txid:vout) is spent
  * Returns the spending transaction hash if spent, null if unspent
+ *
+ * Fast path: one `listunspent` call answers "still unspent" (the common case).
+ * Only when the outpoint is missing from the unspent set is the script history
+ * walked to find the spending transaction.
+ *
+ * Errors propagate. An unanswered question must never be reported as "unspent",
+ * because callers treat null as "this is the authhead".
  */
 export async function getOutputSpendingTx(
   txid: string,
   vout: number
 ): Promise<string | null> {
-  try {
-    // Get the transaction to find output's scriptPubKey
-    const tx = await getTransaction(txid);
+  // Get the transaction to find output's scriptPubKey
+  const tx = await getTransaction(txid);
+  const output = tx?.vout?.[vout];
 
-    if (!tx.vout[vout]) {
-      throw new Error(`Output ${vout} does not exist in transaction ${txid}`);
-    }
+  if (!output) {
+    throw new Error(`Output ${vout} does not exist in transaction ${txid}`);
+  }
 
-    const scriptPubKeyHex = tx.vout[vout].scriptPubKey.hex;
-    const scripthash = calculateScripthash(scriptPubKeyHex);
+  const scriptPubKeyHex = output.scriptPubKey.hex;
 
-    // Get all transactions involving this scripthash
-    const history = await getScripthashHistory(scripthash);
-
-    // Find our transaction in the history
-    const ourTxIndex = history.findIndex((h) => h.tx_hash === txid);
-
-    if (ourTxIndex === -1) {
-      // Transaction not in history - might be unconfirmed or not indexed yet
-      // Assume unspent for now (conservative approach)
-      return null;
-    }
-
-    // Check if there's a transaction after ours (spending transaction)
-    // In Electrum history, transactions are in chronological order
-    // We need to check all subsequent transactions to see if any spend our output
-    for (let i = ourTxIndex + 1; i < history.length; i++) {
-      const candidateTx = await getTransaction(history[i].tx_hash);
-
-      // Check if any input spends our output
-      for (const input of candidateTx.vin) {
-        if (input.txid === txid && input.vout === vout) {
-          return history[i].tx_hash;
-        }
-      }
-    }
-
-    // Output is unspent
-    return null;
-  } catch (error) {
-    // On error, log and return null (assume unspent)
-    console.error(`Warning: Could not check spending status for ${txid}:${vout}:`, error instanceof Error ? error.message : error);
+  // OP_RETURN outputs are provably unspendable (and not in the UTXO index)
+  if (scriptPubKeyHex.startsWith('6a')) {
     return null;
   }
+
+  const scripthash = calculateScripthash(scriptPubKeyHex);
+
+  // Fast path: is the outpoint still in the unspent set?
+  const unspent = await getScripthashUnspent(scripthash);
+  if (unspent.some((u) => u.tx_hash === txid && Number(u.tx_pos) === vout)) {
+    return null;
+  }
+
+  // Slow path: the outpoint is spent; find the spender in the script history.
+  // Electrum history is in chronological order, so the spender follows our tx.
+  const history = await getScripthashHistory(scripthash);
+  const ourTxIndex = history.findIndex((h) => h.tx_hash === txid);
+
+  if (ourTxIndex === -1) {
+    throw new Error(
+      `Transaction ${txid} is neither unspent nor present in the history of its output ${vout} script (not indexed yet?)`
+    );
+  }
+
+  const candidates = [
+    ...history.slice(ourTxIndex + 1),
+    ...history.slice(0, ourTxIndex), // defensive: unexpected ordering
+  ];
+
+  // The spender is usually the very next entry, but on a busy address it can
+  // be hundreds of entries away. Fetch candidates in rounds that double in
+  // size so short scans waste nothing and long scans use the whole pool.
+  let roundSize = 1;
+  let next = 0;
+  while (next < candidates.length) {
+    const round = candidates.slice(next, next + roundSize);
+    const txs = await Promise.all(round.map((c) => getTransaction(c.tx_hash)));
+    for (let j = 0; j < txs.length; j++) {
+      if (txs[j].vin.some((input) => input.txid === txid && input.vout === vout)) {
+        return round[j].tx_hash;
+      }
+    }
+    next += round.length;
+    roundSize = Math.min(roundSize * 2, MAX_CANDIDATE_ROUND);
+  }
+
+  throw new Error(
+    `Output ${txid}:${vout} is not unspent, but no spending transaction was found in its script history`
+  );
 }
 
 /**

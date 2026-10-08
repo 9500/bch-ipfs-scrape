@@ -22,7 +22,7 @@ dotenv.config({ path: join(projectRoot, '.env') });
 // Test input fixture and output file paths
 const inputFixture = join(
   projectRoot,
-  'tests/fixtures/chaingraph/sample-200-registries.json'
+  'tests/fixtures/chaingraph/short-chains-full.json'
 );
 const testOutputFile = join(projectRoot, 'test-authhead.json');
 
@@ -76,7 +76,7 @@ test(
     // Verify at least 1 authhead entry exists
     expect(authheadData.length).toBeGreaterThanOrEqual(1);
 
-    console.log(`  ✓ Created ${authheadData.length} authhead entries from 200 input registries`);
+    console.log(`  ✓ Created ${authheadData.length} authhead entries from the short-chain fixture`);
   }
 );
 

@@ -4,11 +4,12 @@
  * Console application to resolve, export, and fetch Bitcoin Cash Metadata Registries
  */
 
-import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync, statSync, readdirSync } from 'fs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync, statSync, readdirSync, realpathSync } from 'fs';
 import { getBCMRRegistries, fetchAndValidateRegistry, isValidUrlCharacters, type GatewayConfig } from './lib/bcmr.js';
 import { closeConnectionPool } from './lib/fulcrum-client.js';
 import * as dotenv from 'dotenv';
 import { join } from 'path';
+import { pathToFileURL } from 'url';
 import { createHash } from 'crypto';
 import { execSync, spawn } from 'child_process';
 import { CID } from 'multiformats/cid';
@@ -934,7 +935,11 @@ async function doAuthchainResolve(options: {
   console.log(`  Burned (finalized): ${burnedCount}`);
   console.log(`  Excluded ${supersededCount} superseded announcements (older versions of an identity)`);
   console.log(`  Excluded ${invalidCount} invalid (latest announcement has no URIs)`);
-  console.log(`  Excluded ${unresolvedCount} unresolved (authchain walk failed or exceeded maximum length)`);
+  const errorCount = latestPerIdentity.filter(r => r.resolutionError).length;
+  console.log(`  Excluded ${unresolvedCount} unresolved (${errorCount} Fulcrum errors, ${unresolvedCount - errorCount} exceeded maximum chain length)`);
+  if (errorCount > 0) {
+    console.warn(`\nWarning: ${errorCount} announcements could not be resolved because of Fulcrum errors. They were not cached; re-run --authchain-resolve to retry them.`);
+  }
 
   // Convert to authhead.json format
   const authheadData: AuthheadRegistry[] = currentRegistries.map((r) => ({
@@ -1863,5 +1868,29 @@ async function main(): Promise<void> {
   }
 }
 
-// Run the main function
-main();
+/**
+ * True when this module is the script Node was started with.
+ * Unit tests import this module for its exported helpers; running the CLI
+ * there would call process.exit in the middle of an unrelated test.
+ * In the CommonJS bundle (pkg binary) import.meta is empty, and the bundle is
+ * always the entry point.
+ */
+function isRunAsCli(): boolean {
+  const moduleUrl = (import.meta as { url?: string }).url;
+  if (!moduleUrl) {
+    return true;
+  }
+  const entry = process.argv[1];
+  if (!entry) {
+    return false;
+  }
+  try {
+    return pathToFileURL(realpathSync(entry)).href === moduleUrl;
+  } catch {
+    return false;
+  }
+}
+
+if (isRunAsCli()) {
+  main();
+}
